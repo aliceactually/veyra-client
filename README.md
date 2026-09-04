@@ -18,8 +18,11 @@ store API keys.
 
 ```sh
 cd <workspace>/veyra-client
-./veyra.py --cwd <workspace>
+./veyra.py
 ```
+
+The default workspace is the directory containing the sibling `veyra-client`
+and `veyra-core` repositories. Override it with `--cwd PATH` when needed.
 
 By default, Veyra starts on `gpt-5.6-terra` with medium reasoning. Veyra's
 coordinating identity is hard-limited to the reviewed hosted routes
@@ -28,6 +31,13 @@ models, is worker-only. Before App Server starts, the client always runs the
 `veyra-core` fetch and continuity checks. It also discovers models from the
 built-in Ollama and LM Studio providers. Override the core location with `--core PATH` or
 `VEYRA_CORE_REPO`; use `--no-local` to disable local discovery.
+
+Approval requests use Codex automatic review by default. Routine sandbox
+escapes such as protected Git metadata, networked GitHub operations and work in
+an adjacent repository are reviewed without interrupting Alice. The
+`workspace-write` sandbox and `on-request` approval policy remain active, so
+destructive or unusually risky actions can still be denied. Use
+`--approvals-reviewer user` to restore manual prompts for a session.
 
 Run a non-generating connection check with:
 

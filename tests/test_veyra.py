@@ -102,6 +102,7 @@ class MainTests(unittest.TestCase):
             core=Path("unused"),
             model="terra",
             effort="medium",
+            approvals_reviewer="auto_review",
             codex="codex",
             smoke=False,
             no_local=False,
@@ -277,6 +278,25 @@ class FakeServer:
 
 
 class ForkTests(unittest.TestCase):
+    def test_new_threads_use_automatic_approval_review(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server,
+            catalogue,
+            "doctrine",
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        client.start_thread()
+        method, params = server.calls[-1]
+        self.assertEqual(method, "thread/start")
+        self.assertEqual(params["approvalPolicy"], "on-request")
+        self.assertEqual(params["approvalsReviewer"], "auto_review")
+        self.assertEqual(params["sandbox"], "workspace-write")
+
     def test_durable_checkpoint_work_is_explicitly_routed_to_sol_high(self):
         catalogue = self.catalogue_with_luna()
         catalogue.models.append(

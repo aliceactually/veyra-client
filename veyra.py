@@ -28,9 +28,12 @@ from pathlib import Path
 from typing import Any
 
 
-CLIENT_VERSION = "0.2.5"
+CLIENT_VERSION = "0.2.6"
 DEFAULT_MODEL = "gpt-5.6-terra"
 DEFAULT_EFFORT = "medium"
+APPROVAL_POLICY = "on-request"
+DEFAULT_APPROVALS_REVIEWER = "auto_review"
+SANDBOX_MODE = "workspace-write"
 # Veyra's coordinating identity may only run on these reviewed hosted routes.
 # Every other route, including discovered local models, is worker-only.
 VEYRA_HOST_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
@@ -481,6 +484,7 @@ class VeyraClient:
         model: Model,
         effort: str,
         palette: Palette,
+        approvals_reviewer: str = DEFAULT_APPROVALS_REVIEWER,
         debug: bool = False,
     ):
         self.server = server
@@ -491,6 +495,7 @@ class VeyraClient:
         self.model = model
         self.effort = catalogue.validate_effort(model, effort)
         self.palette = palette
+        self.approvals_reviewer = approvals_reviewer
         self.debug = debug
         self.thread_id: str | None = None
         self.thread_provider: str | None = None
@@ -651,9 +656,9 @@ class VeyraClient:
                 "model": self.model.model_id,
                 "modelProvider": self.model.provider,
                 "cwd": str(self.cwd),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
+                "approvalPolicy": APPROVAL_POLICY,
+                "approvalsReviewer": self.approvals_reviewer,
+                "sandbox": SANDBOX_MODE,
                 "developerInstructions": self.developer_instructions,
                 "dynamicTools": self.dynamic_tools(),
                 "serviceName": "veyra_client",
@@ -684,9 +689,9 @@ class VeyraClient:
                 "model": target.model_id,
                 "modelProvider": target.provider,
                 "cwd": str(self.cwd),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
+                "approvalPolicy": APPROVAL_POLICY,
+                "approvalsReviewer": self.approvals_reviewer,
+                "sandbox": SANDBOX_MODE,
                 "developerInstructions": self.developer_instructions,
                 "ephemeral": ephemeral,
             },
@@ -706,9 +711,9 @@ class VeyraClient:
             {
                 "threadId": thread_id,
                 "cwd": str(self.cwd),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
+                "approvalPolicy": APPROVAL_POLICY,
+                "approvalsReviewer": self.approvals_reviewer,
+                "sandbox": SANDBOX_MODE,
                 "developerInstructions": self.developer_instructions,
                 "excludeTurns": True,
             },
@@ -774,8 +779,8 @@ class VeyraClient:
                 "model": self.model.model_id,
                 "effort": self.effort,
                 "cwd": str(self.cwd),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
+                "approvalPolicy": APPROVAL_POLICY,
+                "approvalsReviewer": self.approvals_reviewer,
             },
         )
         turn_id = result["turn"]["id"]
@@ -1021,9 +1026,9 @@ class VeyraClient:
                 "model": target.model_id,
                 "modelProvider": target.provider,
                 "cwd": str(self.cwd),
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "sandbox": "workspace-write",
+                "approvalPolicy": APPROVAL_POLICY,
+                "approvalsReviewer": self.approvals_reviewer,
+                "sandbox": SANDBOX_MODE,
                 "developerInstructions": (
                     self.doctrine
                     + "\n\nYou are a bounded local worker reporting to Veyra. Complete "
@@ -1041,8 +1046,8 @@ class VeyraClient:
             "input": [{"type": "text", "text": prompt}],
             "model": target.model_id,
             "cwd": str(self.cwd),
-            "approvalPolicy": "on-request",
-            "approvalsReviewer": "user",
+            "approvalPolicy": APPROVAL_POLICY,
+            "approvalsReviewer": self.approvals_reviewer,
         }
         if effort:
             turn_params["effort"] = effort
@@ -1424,8 +1429,9 @@ class VeyraClient:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     default_core = Path(__file__).resolve().parent.parent / "veyra-core"
+    default_workspace = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cwd", type=Path, default=Path.cwd())
+    parser.add_argument("--cwd", type=Path, default=default_workspace)
     parser.add_argument(
         "--core",
         type=Path,
@@ -1433,6 +1439,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--effort", default=DEFAULT_EFFORT)
+    parser.add_argument(
+        "--approvals-reviewer",
+        choices=("auto_review", "user"),
+        default=DEFAULT_APPROVALS_REVIEWER,
+        help="route approval requests to automatic review or to the user",
+    )
     parser.add_argument("--codex", default=shutil.which("codex") or "codex")
     parser.add_argument("--smoke", action="store_true")
     parser.add_argument("--no-local", action="store_true")
@@ -1472,6 +1484,7 @@ def main(argv: list[str] | None = None) -> int:
             model,
             effort,
             palette,
+            approvals_reviewer=args.approvals_reviewer,
             debug=args.debug,
         )
         if args.smoke:
