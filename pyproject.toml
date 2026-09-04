@@ -1,0 +1,8 @@
+[project]
+name = "veyra-client"
+version = "0.2.5"
+description = "A minimal terminal client for Codex App Server"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
