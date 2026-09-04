@@ -24,10 +24,13 @@ cd <workspace>/veyra-client
 The default workspace is the directory containing the sibling `veyra-client`
 and `veyra-core` repositories. Override it with `--cwd PATH` when needed.
 
-By default, Veyra starts on `gpt-5.6-terra` with medium reasoning. Veyra's
+By default, Veyra starts on `gpt-5.6-sol` with high reasoning. Veyra's
 coordinating identity is hard-limited to the reviewed hosted routes
 `gpt-5.6-terra` and `gpt-5.6-sol`; every other route, including all local
-models, is worker-only. Before App Server starts, the client always runs the
+models, is worker-only. Coding and nuanced human-interface work remain with
+Sol. Terra is limited to trivial, low-risk, non-coding work; bounded mechanical
+work should normally go to a suitable local worker. Before App Server starts,
+the client always runs the
 `veyra-core` fetch and continuity checks. It also discovers models from the
 built-in Ollama and LM Studio providers. Override the core location with `--core PATH` or
 `VEYRA_CORE_REPO`; use `--no-local` to disable local discovery.

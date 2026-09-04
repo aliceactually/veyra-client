@@ -322,6 +322,25 @@ class ForkTests(unittest.TestCase):
         )
         self.assertIn("use Sol high or above", client.developer_instructions)
 
+    def test_default_route_reserves_terra_for_trivial_non_coding_work(self):
+        args = veyra.parse_args([])
+        self.assertEqual(args.model, "gpt-5.6-sol")
+        self.assertEqual(args.effort, "high")
+
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(),
+            catalogue,
+            "doctrine",
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        self.assertIn("Sol high is the normal substrate", client.developer_instructions)
+        self.assertIn("Terra is exceptional", client.developer_instructions)
+        self.assertIn("nuanced human-interface work", client.developer_instructions)
+
     def test_fork_routes_to_selected_model(self):
         catalogue = veyra.ModelCatalogue(
             [

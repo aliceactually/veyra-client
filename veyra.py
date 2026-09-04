@@ -28,9 +28,9 @@ from pathlib import Path
 from typing import Any
 
 
-CLIENT_VERSION = "0.2.6"
-DEFAULT_MODEL = "gpt-5.6-terra"
-DEFAULT_EFFORT = "medium"
+CLIENT_VERSION = "0.2.7"
+DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_EFFORT = "high"
 APPROVAL_POLICY = "on-request"
 DEFAULT_APPROVALS_REVIEWER = "auto_review"
 SANDBOX_MODE = "workspace-write"
@@ -522,8 +522,9 @@ class VeyraClient:
         local_guidance = ""
         if self.catalogue.local_models:
             local_guidance = (
-                f" Use `{LOCAL_AGENT_TOOL}` for bounded, readily verified exploration, "
-                "planning, coding and review that does not need the strongest model. "
+                f" Use `{LOCAL_AGENT_TOOL}` for bounded, readily verified back-office "
+                "work such as extraction, inventory, formatting, mechanical "
+                "transformation and disposable first drafts. "
                 "Treat local-worker output as advisory and verify consequential results."
             )
         return (
@@ -533,10 +534,13 @@ class VeyraClient:
             + f"`{ROUTE_TOOL}` only when a later turn genuinely warrants a different "
             + "model or reasoning effort. Veyra herself may only run on the approved "
             + "hosted identity routes gpt-5.6-terra and gpt-5.6-sol; local and all "
-            + "other routes are worker-only. Terra medium is the normal coordinating "
-            + "substrate. Prefer Luna or low effort for narrow routine delegation, "
-            + "and Sol high or above for consequential, ambiguous, security-sensitive "
-            + "or unusually difficult work. An explicit request to commit or checkpoint "
+            + "other routes are worker-only. Sol high is the normal substrate for "
+            + "coding, consequential judgement and nuanced human-interface work. "
+            + "Terra is exceptional: use it only for genuinely trivial, low-risk, "
+            + "non-coding work with an immediately verifiable result, and prefer a "
+            + "suitable local D-Class worker when its output can be checked cheaply. "
+            + "Do not downgrade work merely because it is short or conversational. "
+            + "An explicit request to commit or checkpoint "
             + "code together with continuity or memories is consequential by default: "
             + "use Sol high or above for the committing turn. Give a concise reason. "
             + "A requested route "
@@ -553,8 +557,9 @@ class VeyraClient:
                 "name": ROUTE_TOOL,
                 "description": (
                     "Request a model and reasoning-effort route for subsequent turns. "
-                    "Veyra may only use gpt-5.6-terra or gpt-5.6-sol. Use sparingly "
-                    "when the expected work materially changes in difficulty."
+                    "Veyra may only use gpt-5.6-terra or gpt-5.6-sol. Use Sol for "
+                    "coding and human-interface judgement; Terra is limited to "
+                    "trivial, low-risk, non-coding work."
                 ),
                 "inputSchema": {
                     "type": "object",
