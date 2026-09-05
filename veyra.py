@@ -31,7 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.3.0"
+CLIENT_VERSION = "0.3.1"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
 APPROVAL_POLICY = "on-request"
@@ -458,10 +458,32 @@ class ContinuityGate:
         fetch_text = "\n".join(
             part.strip() for part in (fetched.stdout, fetched.stderr) if part.strip()
         )
+        unpublished_commits = 0
         if fetched.returncode == 5:
             print(
                 self.palette.warning(
                     "warning: Veyra core fetch failed; local doctrine may be stale"
+                ),
+                file=sys.stderr,
+            )
+            if fetch_text:
+                print(self.palette.dim(fetch_text), file=sys.stderr)
+        elif fetched.returncode == 7:
+            relation = re.search(
+                r"Veyra core fetched: ahead=(\d+) behind=(\d+)", fetch_text
+            )
+            if relation is None:
+                detail = fetch_text or "fetch-core did not report the divergence"
+                raise VeyraError(f"Veyra core bootstrap stopped: {detail}")
+            ahead, behind = (int(value) for value in relation.groups())
+            if ahead <= 0 or behind != 0:
+                detail = fetch_text or f"ahead={ahead} behind={behind}"
+                raise VeyraError(f"Veyra core bootstrap stopped: {detail}")
+            unpublished_commits = ahead
+            print(
+                self.palette.warning(
+                    "warning: Veyra core has unpublished local commits; "
+                    "continuing with the newer local doctrine"
                 ),
                 file=sys.stderr,
             )
@@ -508,6 +530,13 @@ class ContinuityGate:
                 " The recovered working-memory directory is "
                 f"`{working_memory}`. Consult its relevant material before "
                 "machine-specific inspection or operation."
+            )
+        if unpublished_commits:
+            bootstrap_note += (
+                f" The local Veyra core is {unpublished_commits} commit(s) ahead of "
+                "`origin/main` and is not behind. Continue from the newer local "
+                "doctrine, do not merge, reset or overwrite it automatically, and "
+                "obtain Alice's direction for the unpublished commits."
             )
 
         if wake.is_file():

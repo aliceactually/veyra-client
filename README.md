@@ -36,6 +36,9 @@ the client always runs the
 `veyra-core` fetch and continuity checks. It also discovers models from the
 built-in Ollama and LM Studio providers. Override the core location with
 `--core PATH` or `VEYRA_CORE_REPO`; use `--no-local` to disable local discovery.
+An ahead-only core checkout produces a warning and continues with the newer
+local doctrine so Veyra can obtain Alice's direction. A behind or diverged
+checkout still stops before launch rather than selecting a version implicitly.
 
 Approval requests use Codex automatic review by default. Routine sandbox
 escapes such as protected Git metadata, networked GitHub operations and work in

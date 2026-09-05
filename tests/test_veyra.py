@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import queue
 import sys
 import tempfile
@@ -169,6 +170,85 @@ class DoctrineBundleTests(unittest.TestCase):
                 veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles(
                     "shared"
                 )
+
+
+class ContinuityGateTests(unittest.TestCase):
+    def make_core(self, root):
+        scripts = root / "scripts"
+        scripts.mkdir()
+        (scripts / "fetch-core.sh").touch()
+        (scripts / "continuity-state.py").touch()
+        (root / "AGENTS.md").write_text("shared doctrine", encoding="ascii")
+
+    @staticmethod
+    def state_result():
+        return veyra.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "result": {"state": "recovered"},
+                    "record": {"working_memory_directory": "/private/memories"},
+                }
+            ),
+            stderr="",
+        )
+
+    def test_ahead_only_core_warns_and_continues_with_local_doctrine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_core(root)
+            gate = veyra.ContinuityGate(root, veyra.Palette(False))
+            fetched = veyra.subprocess.CompletedProcess(
+                args=[],
+                returncode=7,
+                stdout="Veyra core fetched: ahead=2 behind=0\n",
+                stderr=(
+                    "Local HEAD differs from origin/main; do not merge or overwrite "
+                    "local work automatically.\n"
+                ),
+            )
+            output = io.StringIO()
+            with (
+                patch.object(
+                    veyra.subprocess, "run", side_effect=[fetched, self.state_result()]
+                ),
+                patch.object(gate, "_load_profiles", return_value=doctrine_bundle()) as load,
+                redirect_stderr(output),
+            ):
+                self.assertIs(gate.verify(), load.return_value)
+
+        self.assertIn("unpublished local commits", output.getvalue())
+        shared = load.call_args.args[0]
+        self.assertIn("2 commit(s) ahead", shared)
+        self.assertIn("obtain Alice's direction", shared)
+
+    def test_behind_core_still_stops_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_core(root)
+            gate = veyra.ContinuityGate(root, veyra.Palette(False))
+            fetched = veyra.subprocess.CompletedProcess(
+                args=[],
+                returncode=7,
+                stdout="Veyra core fetched: ahead=0 behind=2\n",
+                stderr="Local HEAD differs from origin/main.\n",
+            )
+            with patch.object(veyra.subprocess, "run", return_value=fetched):
+                with self.assertRaisesRegex(veyra.VeyraError, "bootstrap stopped"):
+                    gate.verify()
+
+    def test_unparseable_fetch_divergence_stops_bootstrap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_core(root)
+            gate = veyra.ContinuityGate(root, veyra.Palette(False))
+            fetched = veyra.subprocess.CompletedProcess(
+                args=[], returncode=7, stdout="", stderr="unexpected divergence\n"
+            )
+            with patch.object(veyra.subprocess, "run", return_value=fetched):
+                with self.assertRaisesRegex(veyra.VeyraError, "bootstrap stopped"):
+                    gate.verify()
 
 
 class MainTests(unittest.TestCase):
