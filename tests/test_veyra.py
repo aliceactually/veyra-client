@@ -128,6 +128,12 @@ class PaletteTests(unittest.TestCase):
     def test_terminal_detection_is_independent_of_colour(self):
         self.assertTrue(veyra.Palette(False, terminal=True).terminal)
 
+    def test_named_prompt_colour_uses_the_constrained_palette(self):
+        palette = veyra.Palette(True)
+        self.assertEqual(palette.colour("magenta", "Alice> "), "\033[35mAlice> \033[0m")
+        with self.assertRaisesRegex(veyra.VeyraError, "unknown prompt colour"):
+            palette.colour("ultraviolet", "Alice> ")
+
 
 class AppServerEventRoutingTests(unittest.TestCase):
     def test_thread_events_are_routed_without_cross_consumption(self):
@@ -360,6 +366,42 @@ class ContinuityGateTests(unittest.TestCase):
                 with self.assertRaisesRegex(veyra.VeyraError, "bootstrap stopped"):
                     gate.verify()
 
+    def test_circadian_wake_returns_a_non_blocking_pending_attestation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            (scripts / "muse-cycle.py").touch()
+            gate = veyra.ContinuityGate(root, veyra.Palette(False))
+            scheduled = veyra.subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "state": "prepared",
+                        "cycle_id": "cycle-123",
+                        "cycle": "/cache/cycle.json",
+                        "sources": 2,
+                        "consolidation_job": "/cache/consolidation.json",
+                        "dream_job": "/cache/dream.json",
+                        "latest_dream": {
+                            "state": "available",
+                            "title": "The Brass Orchard",
+                            "dream": "I found a warm moon in a filing cabinet.",
+                        },
+                    }
+                ),
+                stderr="",
+            )
+            with patch.object(veyra.subprocess, "run", return_value=scheduled):
+                note = gate._circadian_wake(Path("/private/memories"))
+
+        self.assertIn("does not block the current user's request", note)
+        self.assertIn("creative, non-evidentiary", note)
+        self.assertIn("/cache/dream.json", note)
+        self.assertIn("The Brass Orchard", note)
+        self.assertIn("Veyra decides whether to share it", note)
+
 
 class MainTests(unittest.TestCase):
     def test_ctrl_c_exits_cleanly_without_a_traceback(self):
@@ -394,18 +436,24 @@ class MainTests(unittest.TestCase):
         add_history.assert_called_once_with("Reloaded")
 
     @unittest.skipIf(veyra.readline is None, "readline is unavailable")
-    def test_read_line_uses_plain_prompt_with_libedit_wrapped_editing(self):
-        coloured_prompt = "\033[36malice> \033[0m"
+    def test_read_line_colours_libedit_prompt_without_width_skew(self):
+        coloured_prompt = "\033[35mAlice> \033[0m"
+        stdout = io.StringIO()
         with (
-            patch("builtins.input", return_value="a long wrapped message") as read,
+            patch(
+                "builtins.input", return_value="a long wrapped message"
+            ) as input_mock,
             patch.object(veyra.readline, "add_history"),
             patch.object(veyra.readline, "__doc__", "libedit readline wrapper"),
+            patch.object(veyra.readline, "backend", "editline", create=True),
+            redirect_stdout(stdout),
         ):
             self.assertEqual(
                 veyra.VeyraClient._read_line(coloured_prompt),
                 "a long wrapped message",
             )
-        read.assert_called_once_with("alice> ")
+        input_mock.assert_called_once_with("\033[0000m")
+        self.assertEqual(stdout.getvalue(), coloured_prompt)
 
     @unittest.skipIf(veyra.readline is None, "readline is unavailable")
     def test_read_line_marks_gnu_readline_colours_as_zero_width(self):
@@ -414,6 +462,7 @@ class MainTests(unittest.TestCase):
             patch("builtins.input", return_value="wrapped") as read,
             patch.object(veyra.readline, "add_history"),
             patch.object(veyra.readline, "__doc__", "GNU readline wrapper"),
+            patch.object(veyra.readline, "backend", "readline", create=True),
         ):
             self.assertEqual(veyra.VeyraClient._read_line(coloured_prompt), "wrapped")
         read.assert_called_once_with(
@@ -630,6 +679,97 @@ class RoutedWorkerServer(FakeServer):
 
 
 class ForkTests(unittest.TestCase):
+    def test_user_prompt_starts_generic(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        self.assertEqual(client.user_prompt, "user> ")
+
+    def test_only_veyra_tool_personalises_the_user_prompt(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(True)
+        )
+        tools = {tool["name"]: tool for tool in client.dynamic_tools()}
+        self.assertIn(veyra.USER_PROMPT_TOOL, tools)
+        self.assertEqual(
+            tools[veyra.USER_PROMPT_TOOL]["inputSchema"]["properties"]["colour"]["enum"],
+            sorted(veyra.PROMPT_COLOURS),
+        )
+        self.assertIn(veyra.USER_PROMPT_TOOL, client.developer_instructions)
+        with redirect_stdout(io.StringIO()):
+            client._handle_user_prompt(
+                21, {"name": "Alice", "colour": "magenta"}
+            )
+        self.assertEqual(client.user_prompt_name, "Alice")
+        self.assertEqual(client.user_prompt_colour, "magenta")
+        self.assertEqual(client.user_prompt, "\033[35mAlice> \033[0m")
+        self.assertTrue(server.calls[-1][1]["result"]["success"])
+        with self.assertRaisesRegex(veyra.VeyraError, "unknown command"):
+            client._command("/prompt Alice")
+
+    def test_user_prompt_preferences_persist_across_clients(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        with tempfile.TemporaryDirectory() as directory:
+            preferences = Path(directory) / "veyra-client" / "preferences.json"
+            client = veyra.VeyraClient(
+                server, catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("terra"), "medium", veyra.Palette(True),
+                prompt_preferences_path=preferences,
+            )
+            with redirect_stdout(io.StringIO()):
+                client._handle_user_prompt(
+                    23, {"name": "alice", "colour": "magenta"}
+                )
+            self.assertEqual(
+                json.loads(preferences.read_text(encoding="utf-8")),
+                {"version": 1, "name": "alice", "colour": "magenta"},
+            )
+            restored = veyra.VeyraClient(
+                FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("terra"), "medium", veyra.Palette(True),
+                prompt_preferences_path=preferences,
+            )
+        self.assertEqual(restored.user_prompt_name, "alice")
+        self.assertEqual(restored.user_prompt_colour, "magenta")
+        self.assertEqual(restored.user_prompt, "\033[35malice> \033[0m")
+
+    def test_invalid_user_prompt_preferences_fall_back_to_generic(self):
+        catalogue = self.catalogue_with_luna()
+        with tempfile.TemporaryDirectory() as directory:
+            preferences = Path(directory) / "preferences.json"
+            preferences.write_text(
+                '{"version": 1, "name": "bad\\u001b[31m"}',
+                encoding="utf-8",
+            )
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                client = veyra.VeyraClient(
+                    FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+                    catalogue.resolve("terra"), "medium", veyra.Palette(False),
+                    prompt_preferences_path=preferences,
+                )
+        self.assertEqual(client.user_prompt, "user> ")
+        self.assertIn("ignoring invalid prompt preferences", stderr.getvalue())
+
+    def test_prompt_tool_rejects_terminal_control_text(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client._handle_user_prompt(
+            22, {"name": "Alice\033[31m", "colour": "red"}
+        )
+        self.assertEqual(client.user_prompt, "user> ")
+        self.assertFalse(server.calls[-1][1]["result"]["success"])
+
     def test_constructor_rejects_plain_doctrine_text(self):
         catalogue = self.catalogue_with_luna()
         with self.assertRaisesRegex(veyra.VeyraError, "versioned DoctrineBundle"):

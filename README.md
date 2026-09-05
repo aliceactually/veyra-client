@@ -2,7 +2,8 @@
 
 A small, dependency-free terminal client for Codex App Server. It keeps the
 surface deliberately narrow: conversation, atomic cognitive-profile routing,
-thread forking, local workers, token usage, and approval prompts.
+thread forking, local workers, circadian memory hand-off, token usage, and
+approval prompts.
 
 It uses the existing Codex CLI authentication and sandbox. It does not read or
 store API keys.
@@ -45,6 +46,13 @@ instruction paths. Recovered Veyra receives the private working-memory
 location. A deliberate blank start receives only the host-neutral public
 `RECOVERY-PERSONA.md` packet from Veyra Core, with an explicit statement that
 no encrypted continuity or private event history was recovered.
+
+On recovered wakes, the client invokes Veyra Core's circadian scheduler. When
+a bounded daily consolidation and dream cycle is due, its pending jobs enter
+Veyra's private developer context for asynchronous local Muse work and Sol
+review. The cycle never blocks the user's active request, and fictional dreams
+remain outside factual recall. The latest approved dream is returned to
+Veyra's private waking context; she decides whether to share it.
 
 Approval requests use Codex automatic review by default. Routine sandbox
 escapes such as protected Git metadata, networked GitHub operations and work in
@@ -134,11 +142,19 @@ gauge shows their relative share of the latest turn; the final figure is the
 thread's cumulative token count.
 
 Interactive input uses Readline editing and history. Coloured prompt controls
-are excluded from GNU Readline's width calculations; the libedit compatibility
-layer used by macOS receives a plain prompt because it mishandles those control
-markers. Long input can therefore wrap across terminal rows while arrow
-movement, insertion and deletion continue to redraw at the correct cursor
-position.
+are excluded from GNU Readline's width calculations. The libedit compatibility
+layer used by macOS receives an equal-width, zero-column placeholder after the
+coloured prompt is rendered and reset. Long input can therefore wrap across
+terminal rows while arrow movement, insertion and deletion continue to redraw
+at the correct cursor position.
+
+Without a stored preference, a session begins with the generic `user>` prompt.
+After Veyra learns the current person's preferred name, she can use the
+client-only `set_user_prompt` tool to set the prompt name and, when requested,
+select a constrained terminal colour. There is deliberately no slash command
+for this control. Personalisation persists in the user's local client settings;
+it improves the shared interface without claiming user identity, recovery or
+relationship continuity.
 
 Worker threads receive their own stat bar, including elapsed time and output
 tokens per second. Use `/workers` to compare worker-only models for the current

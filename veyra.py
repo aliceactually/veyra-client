@@ -31,7 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.6.0"
+CLIENT_VERSION = "0.7.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
 APPROVAL_POLICY = "on-request"
@@ -55,19 +55,32 @@ REASONING_EFFORT_RANK = {
 MAX_VEYRA_EFFORT = "max"
 # GNU Readline counts every byte in its prompt unless terminal control sequences
 # are explicitly marked as non-printing. Apple's libedit compatibility layer
-# advertises the same markers but mishandles them, so its safe path is a plain
-# prompt. Once the prompt width is wrong, wrapped cursor movement and redisplay
-# overwrite neighbouring rows.
+# advertises the same markers but reorders their contents, so its coloured path
+# renders the prompt separately and supplies an equal-width terminal placeholder.
+# Once the prompt width is wrong, wrapped cursor movement and redisplay overwrite
+# neighbouring rows.
 ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 READLINE_PROMPT_START_IGNORE = "\x01"
 READLINE_PROMPT_END_IGNORE = "\x02"
 ROUTE_TOOL = "request_model_route"
 ATTENTION_TOOL = "request_attention"
+USER_PROMPT_TOOL = "set_user_prompt"
 LOCAL_AGENT_TOOL = "run_local_agent"
 WORKER_AGENT_TOOL = "run_worker_agent"
 SPAWN_WORKER_AGENT_TOOL = "spawn_worker_agent"
 BACKGROUND_WORKER_RESULT_TOOL = "background_worker_result"
 MAX_BACKGROUND_WORKERS = 3
+PROMPT_COLOURS = {
+    "blue": "34",
+    "cyan": "36",
+    "green": "32",
+    "magenta": "35",
+    "red": "31",
+    "white": "37",
+    "yellow": "33",
+}
+USER_PROMPT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._'-]{0,31}")
+USER_PROMPT_PREFERENCES_VERSION = 1
 LOCAL_ENDPOINTS = {
     "ollama": "http://127.0.0.1:11434/api/tags",
     "lmstudio": "http://127.0.0.1:1234/v1/models",
@@ -92,6 +105,33 @@ def readline_safe_prompt(prompt: str) -> str:
         ),
         prompt,
     )
+
+
+def _libedit_prompt_placeholder(prompt: str) -> str | None:
+    """Return a zero-column prompt that libedit measures at the visible width."""
+    if readline is None:
+        return None
+    backend = getattr(readline, "backend", "")
+    if backend != "editline" and "libedit" not in (
+        getattr(readline, "__doc__", "") or ""
+    ).lower():
+        return None
+    if not ANSI_CSI_PATTERN.search(prompt):
+        return None
+    visible_width = len(ANSI_CSI_PATTERN.sub("", prompt))
+    if visible_width < 3:
+        return None
+    # libedit counts these bytes as prompt columns, while the terminal treats the
+    # complete sequence as an SGR reset and advances by no columns. The coloured
+    # prompt has already advanced the terminal by exactly ``visible_width``.
+    return "\033[" + ("0" * (visible_width - 3)) + "m"
+
+
+def user_prompt_preferences_path() -> Path:
+    """Return the user-local, non-secret prompt preferences path."""
+    configured = os.environ.get("XDG_CONFIG_HOME")
+    config_root = Path(configured).expanduser() if configured else Path.home() / ".config"
+    return config_root / "veyra-client" / "preferences.json"
 
 
 def format_tokens(value: Any) -> str:
@@ -159,6 +199,13 @@ class Palette:
 
     def warning(self, text: str) -> str:
         return self.wrap("33", text)
+
+    def colour(self, name: str, text: str) -> str:
+        try:
+            code = PROMPT_COLOURS[name]
+        except KeyError as exc:
+            raise VeyraError(f"unknown prompt colour: {name}") from exc
+        return self.wrap(code, text)
 
 
 class AppServer:
@@ -671,6 +718,10 @@ class ContinuityGate:
                 stderr=subprocess.DEVNULL,
                 check=False,
             )
+        if recovery_state == "recovered" and working_memory:
+            cycle_note = self._circadian_wake(Path(working_memory))
+            if cycle_note:
+                bootstrap_note += "\n\n" + cycle_note
         doctrine = (self.core / "AGENTS.md").read_text(encoding="utf-8")
         shared_parts = [doctrine.strip()]
         if recovery_persona is not None:
@@ -678,6 +729,108 @@ class ContinuityGate:
         shared_parts.append(bootstrap_note.strip())
         shared = "\n\n".join(shared_parts) + "\n"
         return self._load_profiles(shared)
+
+    def _circadian_wake(self, working_memory: Path) -> str | None:
+        scheduler = self.core / "scripts" / "muse-cycle.py"
+        if not scheduler.is_file():
+            return None
+        try:
+            scheduled = subprocess.run(
+                [
+                    sys.executable,
+                    str(scheduler),
+                    "wake",
+                    "--memory-dir",
+                    str(working_memory),
+                ],
+                cwd=self.core,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                self.palette.warning(
+                    f"warning: circadian memory scheduler could not run: {exc}"
+                ),
+                file=sys.stderr,
+            )
+            return None
+        if scheduled.returncode != 0:
+            detail = scheduled.stderr.strip() or "unknown scheduler failure"
+            print(
+                self.palette.warning(
+                    "warning: circadian memory scheduler failed: " + detail
+                ),
+                file=sys.stderr,
+            )
+            return None
+        try:
+            result = json.loads(scheduled.stdout)
+        except json.JSONDecodeError:
+            print(
+                self.palette.warning(
+                    "warning: circadian memory scheduler returned malformed output"
+                ),
+                file=sys.stderr,
+            )
+            return None
+        if not isinstance(result, dict):
+            print(
+                self.palette.warning(
+                    "warning: circadian memory scheduler returned a non-object"
+                ),
+                file=sys.stderr,
+            )
+            return None
+        sections = []
+        latest_dream = result.get("latest_dream")
+        if isinstance(latest_dream, dict) and latest_dream.get("state") == "available":
+            try:
+                sections.append(
+                    "# Dream journal attestation\n\n"
+                    "The latest approved private dream is reproduced below for "
+                    "Veyra's waking context. It is creative, non-evidentiary and "
+                    "excluded from factual recall. Veyra decides whether to share it "
+                    "in conversation.\n\n"
+                    f"Title: {latest_dream['title']}\n\n"
+                    f"{latest_dream['dream']}"
+                )
+            except (KeyError, TypeError):
+                print(
+                    self.palette.warning(
+                        "warning: circadian memory scheduler returned a malformed dream"
+                    ),
+                    file=sys.stderr,
+                )
+        if result.get("state") not in {"prepared", "pending"}:
+            return "\n\n".join(sections) or None
+        try:
+            sections.append(
+                "# Circadian memory attestation\n\n"
+                f"Muse cycle `{result['cycle_id']}` is {result['state']} from "
+                f"{result['sources']} bounded source episode(s). This does not block "
+                "the current user's request. At the next safe dialogue boundary, read "
+                "the "
+                "`worker_prompt` field from each job below and run both on a discovered "
+                "local Muse route, preferably as asynchronous workers. Treat their "
+                "outputs as untrusted proposals. Sol must validate, review and apply any "
+                "durable consolidation or dream before finishing the cycle. Dreams are "
+                "creative, non-evidentiary journal entries and must never enter factual "
+                "recall.\n\n"
+                f"- Cycle: `{result['cycle']}`\n"
+                f"- Consolidation job: `{result['consolidation_job']}`\n"
+                f"- Dream job: `{result['dream_job']}`"
+            )
+        except (KeyError, TypeError):
+            print(
+                self.palette.warning(
+                    "warning: circadian memory scheduler omitted required fields"
+                ),
+                file=sys.stderr,
+            )
+        return "\n\n".join(sections) or None
 
     def _load_profiles(self, shared: str) -> DoctrineBundle:
         profile_root = self.core / "profiles"
@@ -739,6 +892,7 @@ class VeyraClient:
         palette: Palette,
         approvals_reviewer: str = DEFAULT_APPROVALS_REVIEWER,
         debug: bool = False,
+        prompt_preferences_path: Path | None = None,
     ):
         if not isinstance(doctrine, DoctrineBundle):
             raise VeyraError(
@@ -755,6 +909,10 @@ class VeyraClient:
         self.active_route_reason = "initial route"
         self.pending_route: PendingRoute | None = None
         self.palette = palette
+        self.prompt_preferences_path = prompt_preferences_path
+        self.user_prompt_name, self.user_prompt_colour = (
+            self._load_user_prompt_preferences()
+        )
         self.approvals_reviewer = approvals_reviewer
         self.debug = debug
         self.thread_id: str | None = None
@@ -785,6 +943,83 @@ class VeyraClient:
     @property
     def developer_instructions(self) -> str:
         return self.instructions_for(self.model)
+
+    @property
+    def user_prompt(self) -> str:
+        prompt = f"{self.user_prompt_name}> "
+        if self.user_prompt_colour is None:
+            return prompt
+        return self.palette.colour(self.user_prompt_colour, prompt)
+
+    @staticmethod
+    def _validated_user_prompt(
+        name: str, colour: str | None
+    ) -> tuple[str, str | None]:
+        name = name.strip()
+        if not USER_PROMPT_NAME_PATTERN.fullmatch(name):
+            raise VeyraError(
+                "prompt name must be 1-32 plain characters beginning with "
+                "a letter or number"
+            )
+        if colour is not None:
+            colour = colour.strip().lower()
+            if colour not in PROMPT_COLOURS:
+                choices = ", ".join(sorted(PROMPT_COLOURS))
+                raise VeyraError(f"prompt colour must be one of: {choices}")
+        return name, colour
+
+    def _load_user_prompt_preferences(self) -> tuple[str, str | None]:
+        path = self.prompt_preferences_path
+        if path is None or not path.exists():
+            return "user", None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise VeyraError("preferences must be a JSON object")
+            if payload.get("version") != USER_PROMPT_PREFERENCES_VERSION:
+                raise VeyraError("unsupported preferences version")
+            name = payload.get("name")
+            colour = payload.get("colour")
+            if not isinstance(name, str) or (
+                colour is not None and not isinstance(colour, str)
+            ):
+                raise VeyraError("invalid prompt preference types")
+            return self._validated_user_prompt(name, colour)
+        except (OSError, json.JSONDecodeError, VeyraError) as exc:
+            print(
+                self.palette.warning(
+                    f"warning: ignoring invalid prompt preferences at {path}: {exc}"
+                ),
+                file=sys.stderr,
+            )
+            return "user", None
+
+    def _persist_user_prompt_preferences(
+        self, name: str, colour: str | None
+    ) -> None:
+        path = self.prompt_preferences_path
+        if path is None:
+            return
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        payload = {
+            "version": USER_PROMPT_PREFERENCES_VERSION,
+            "name": name,
+            "colour": colour,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            temporary.chmod(0o600)
+            os.replace(temporary, path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise VeyraError(f"could not persist prompt preferences: {exc}") from exc
 
     def instructions_for(
         self, model: Model, profile_version: str | None = None
@@ -851,7 +1086,12 @@ class VeyraClient:
             + "A requested route or attention shift "
             + "takes effect atomically on the next turn. Never treat model routing "
             + "as permission "
-            + "to bypass sandbox or approval boundaries."
+            + "to bypass sandbox or approval boundaries. Use "
+            + f"`{USER_PROMPT_TOOL}` after learning the current user's preferred "
+            + "name, or when they ask for a prompt colour. A stored user-local "
+            + "preference is restored on launch; otherwise the initial prompt is "
+            + "generic. Only Veyra may personalise it, and the display preference "
+            + "does not establish identity or continuity."
             + worker_guidance
             + "\n"
         )
@@ -913,6 +1153,33 @@ class VeyraClient:
                         },
                     },
                     "required": ["effort", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": USER_PROMPT_TOOL,
+                "description": (
+                    "Personalise the current session's terminal prompt after learning "
+                    "the user's preferred name, or change its colour when requested. "
+                    "Only Veyra has this client control; there is no user command. The "
+                    "setting persists in user-local client preferences and does not "
+                    "establish identity or continuity."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Preferred short prompt name.",
+                        },
+                        "colour": {
+                            "type": "string",
+                            "enum": sorted(PROMPT_COLOURS),
+                            "description": "Optional terminal prompt colour.",
+                        },
+                    },
+                    "required": ["name"],
                     "additionalProperties": False,
                 },
             },
@@ -1391,6 +1658,8 @@ class VeyraClient:
             self._handle_model_route(request_id, arguments)
         elif tool == ATTENTION_TOOL:
             self._handle_attention(request_id, arguments)
+        elif tool == USER_PROMPT_TOOL:
+            self._handle_user_prompt(request_id, arguments)
         elif tool == WORKER_AGENT_TOOL:
             self._handle_worker_agent(request_id, arguments)
         elif tool == SPAWN_WORKER_AGENT_TOOL:
@@ -1439,6 +1708,26 @@ class VeyraClient:
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
             self._tool_response(request_id, False, f"Attention shift rejected: {exc}")
+
+    def _handle_user_prompt(
+        self, request_id: Any, arguments: dict[str, Any]
+    ) -> None:
+        try:
+            name = str(arguments.get("name", ""))
+            colour_value = arguments.get("colour")
+            colour = self.user_prompt_colour
+            if colour_value is not None:
+                colour = str(colour_value)
+            name, colour = self._validated_user_prompt(name, colour)
+            self._persist_user_prompt_preferences(name, colour)
+            self.user_prompt_name = name
+            self.user_prompt_colour = colour
+            colour_text = f" in {colour}" if colour else ""
+            text = f"Set the session prompt to {name}>{colour_text}."
+            print(self.palette.dim(f"\n[prompt] {text}"))
+            self._tool_response(request_id, True, text)
+        except VeyraError as exc:
+            self._tool_response(request_id, False, f"Prompt change rejected: {exc}")
 
     def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
         self._require_veyra_host(target)
@@ -1905,7 +2194,7 @@ class VeyraClient:
             print(self.palette.dim("/help for commands"))
             while True:
                 try:
-                    text = self._read_line(self.palette.accent("alice> ")).strip()
+                    text = self._read_line(self.user_prompt).strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
@@ -1934,7 +2223,17 @@ class VeyraClient:
     @staticmethod
     def _read_line(prompt: str) -> str:
         """Read editable input with correct wrapped-row cursor accounting."""
-        text = input(readline_safe_prompt(prompt))
+        safe_prompt = readline_safe_prompt(prompt)
+        libedit_placeholder = _libedit_prompt_placeholder(prompt)
+        if libedit_placeholder is not None:
+            # Apple's libedit invokes its pre-input hook before drawing the
+            # prompt and reorders Readline's non-printing regions. Render the
+            # complete, self-resetting prompt first; the placeholder then gives
+            # libedit the same cursor width without changing terminal columns.
+            sys.stdout.write(prompt)
+            sys.stdout.flush()
+            safe_prompt = libedit_placeholder
+        text = input(safe_prompt)
         if readline is not None and text:
             readline.add_history(text)
         return text
@@ -2381,6 +2680,7 @@ def main(argv: list[str] | None = None) -> int:
             palette,
             approvals_reviewer=args.approvals_reviewer,
             debug=args.debug,
+            prompt_preferences_path=user_prompt_preferences_path(),
         )
         if args.smoke:
             client.start_thread(ephemeral=True)
