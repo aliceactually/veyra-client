@@ -68,6 +68,10 @@ Run a non-generating connection check with:
 - `/attention [LEVEL]` - inspect or set attention for later turns
 - `/local MODEL PROMPT` - run a bounded local worker directly
 - `/worker MODEL PROMPT` - run a bounded task on any worker-only route
+- `/bgworker MODEL PROMPT` - start a read-only worker and return to the prompt
+- `/jobs` - list background worker jobs
+- `/job ID` - inspect one background worker and its report
+- `/cancel-job ID` - interrupt a background worker
 - `/fork [MODEL] [EFFORT]` - branch the current history and enter the fork
 - `/new` - start an empty thread
 - `/threads` - list recent threads
@@ -79,10 +83,14 @@ Run a non-generating connection check with:
 Veyra can call the client-provided `request_attention` tool to change reasoning
 effort without changing model. Attention starts at medium, rises to high or
 xhigh when the depth or consequence of the work warrants it, and settles back
-towards medium afterwards. Each shift is reasoned, visible in the terminal, and
-applies to the next turn; max effort is not selected automatically. `/attention`
-shows the active or pending level, while `/thread` shows the active route,
-attention, profile version and transition reason.
+towards medium afterwards. Veyra may recommend max for important work, but must
+ask Alice before selecting it for that use. Max is a behavioural consent
+boundary rather than a client prohibition; once Alice agrees, Veyra can request
+it directly. The client hard-rejects ultra and any unclassified effort, keeping
+max as the mechanical ceiling. Each shift is reasoned, visible in the terminal,
+and applies to the next turn. `/attention` shows the active or pending level, while
+`/thread` shows the active route, attention, profile version and transition
+reason.
 
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then
@@ -97,7 +105,21 @@ Cross-provider routes automatically fork the current history. The
 the coordinating model run a bounded task on a discovered local model and
 receive its report. The `run_worker_agent` tool does the same on any worker-only
 route, including a lower-capability hosted route, while keeping Veyra on an
-approved identity host.
+approved identity host. For separable work, `spawn_worker_agent` returns a job
+ID immediately and lets conversation continue while the worker runs. This works
+for hosted worker-only routes, Ollama and LM Studio. Background jobs are
+read-only, limited to three concurrent workers, and cannot interrupt Alice for
+approvals. Synchronous worker tools remain available when Veyra needs the report
+inside the current answer.
+
+Completed reports return to Veyra as standalone tool output rather than as a
+fabricated user message. If a report arrives during a turn, Veyra handles it
+immediately after that turn. If Alice is composing input, the status row shows
+that a report is ready and the client waits until Enter before collecting it,
+preserving the active Readline buffer. `/jobs` and `/job ID` expose the same
+state directly. Jobs are session-scoped; exiting the client stops unfinished
+workers. Reports remain attached to the Veyra thread that launched them, so
+switching threads does not inject an old report into unrelated context.
 
 The public identity and safety doctrine is shared by both routes. Route-specific
 profiles live in `veyra-core/profiles`; worker threads receive an identity-free
@@ -122,6 +144,9 @@ Worker threads receive their own stat bar, including elapsed time and output
 tokens per second. Use `/workers` to compare worker-only models for the current
 client session. These figures are performance indicators, not a cross-session
 benchmark database.
+
+App Server notifications are routed per thread, so a background worker cannot
+consume or discard Veyra's turn events (or those of another worker).
 
 Local routes are written as `provider:model`, for example:
 

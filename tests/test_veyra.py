@@ -4,6 +4,8 @@ import json
 import queue
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -79,6 +81,23 @@ class ModelCatalogueTests(unittest.TestCase):
         with self.assertRaises(veyra.VeyraError):
             self.catalogue.validate_effort(sol, "low")
 
+    def test_veyra_effort_has_a_hard_maximum(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "max"},
+                    {"reasoningEffort": "ultra"},
+                ],
+            }]
+        )
+        sol = catalogue.resolve("sol")
+        self.assertEqual(catalogue.validate_veyra_effort(sol, "max"), "max")
+        with self.assertRaisesRegex(veyra.VeyraError, "hard effort ceiling is max"):
+            catalogue.validate_veyra_effort(sol, "ultra")
+
     def test_adds_and_resolves_local_provider_route(self):
         self.catalogue.add_local("ollama", ["veyra-intel-coder:qwen3-coder-32k"])
         model = self.catalogue.resolve(
@@ -108,6 +127,22 @@ class PaletteTests(unittest.TestCase):
 
     def test_terminal_detection_is_independent_of_colour(self):
         self.assertTrue(veyra.Palette(False, terminal=True).terminal)
+
+
+class AppServerEventRoutingTests(unittest.TestCase):
+    def test_thread_events_are_routed_without_cross_consumption(self):
+        server = veyra.AppServer("codex")
+        first = server.event_queue("first")
+        second = server.event_queue("second")
+        server._publish_event(
+            {"method": "turn/completed", "params": {"threadId": "first"}}
+        )
+        server._publish_event(
+            {"method": "turn/completed", "params": {"threadId": "second"}}
+        )
+        self.assertEqual(first.get_nowait()["params"]["threadId"], "first")
+        self.assertEqual(second.get_nowait()["params"]["threadId"], "second")
+        self.assertTrue(server.events.empty())
 
 
 class DoctrineBundleTests(unittest.TestCase):
@@ -554,6 +589,46 @@ class FakeServer:
         self.calls.append(("respond", {"id": request_id, "result": result}))
 
 
+class RoutedWorkerServer(FakeServer):
+    def __init__(self):
+        super().__init__()
+        self.thread_events = {}
+
+    def event_queue(self, thread_id):
+        return self.thread_events.setdefault(thread_id, queue.Queue())
+
+    def release_event_queue(self, thread_id):
+        self.thread_events.pop(thread_id, None)
+
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "background-thread"}}
+        if method == "turn/start":
+            events = self.thread_events[params["threadId"]]
+            events.put(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turnId": "background-turn",
+                        "delta": "worker report",
+                    },
+                }
+            )
+            events.put(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turn": {"id": "background-turn", "status": "completed"},
+                    },
+                }
+            )
+            return {"turn": {"id": "background-turn"}}
+        raise AssertionError(f"unexpected method: {method}")
+
+
 class ForkTests(unittest.TestCase):
     def test_constructor_rejects_plain_doctrine_text(self):
         catalogue = self.catalogue_with_luna()
@@ -629,7 +704,8 @@ class ForkTests(unittest.TestCase):
         )
         self.assertIn("Normal attention is Sol at medium", client.developer_instructions)
         self.assertIn("request_attention", client.developer_instructions)
-        self.assertIn("Do not select max automatically", client.developer_instructions)
+        self.assertIn("Max requires Alice's explicit permission", client.developer_instructions)
+        self.assertIn("client hard-rejects higher", client.developer_instructions)
         self.assertIn("high for coding", client.developer_instructions)
         self.assertIn("ambient, low-stakes conversation", client.developer_instructions)
         self.assertIn("Terra must request Sol", client.developer_instructions)
@@ -642,6 +718,14 @@ class ForkTests(unittest.TestCase):
         )
         tools = {tool["name"]: tool for tool in client.dynamic_tools()}
         self.assertIn(veyra.ATTENTION_TOOL, tools)
+        self.assertIn(
+            "Max requires Alice's explicit permission",
+            tools[veyra.ATTENTION_TOOL]["description"],
+        )
+        self.assertIn(
+            "efforts above max are prohibited",
+            tools[veyra.ATTENTION_TOOL]["description"],
+        )
         schema = tools[veyra.ATTENTION_TOOL]["inputSchema"]
         self.assertEqual(schema["required"], ["effort", "reason"])
         self.assertNotIn("model", schema["properties"])
@@ -699,7 +783,7 @@ class ForkTests(unittest.TestCase):
         self.assertIsNone(client.pending_route)
         self.assertFalse(server.calls[-1][1]["result"]["success"])
 
-    def test_attention_tool_cannot_select_max_automatically(self):
+    def test_attention_tool_can_select_max_after_explicit_permission(self):
         catalogue = veyra.ModelCatalogue(
             [{
                 "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
@@ -715,13 +799,53 @@ class ForkTests(unittest.TestCase):
             server, catalogue, doctrine_bundle(), Path.cwd(),
             catalogue.resolve("sol"), "medium", veyra.Palette(False)
         )
+        with redirect_stdout(io.StringIO()):
+            client._handle_attention(
+                14,
+                {
+                    "effort": "max",
+                    "reason": "Alice explicitly approved max for this review",
+                },
+            )
+        self.assertEqual(client.pending_route.effort, "max")
+        response = server.calls[-1][1]["result"]
+        self.assertTrue(response["success"])
+
+    def test_attention_tool_hard_rejects_effort_above_max(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "max"},
+                    {"reasoningEffort": "ultra"},
+                ],
+            }]
+        )
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
         client._handle_attention(
-            14, {"effort": "max", "reason": "automatic escalation"}
+            15, {"effort": "ultra", "reason": "exceed the ceiling"}
         )
         self.assertIsNone(client.pending_route)
         response = server.calls[-1][1]["result"]
         self.assertFalse(response["success"])
-        self.assertIn("manual selection", response["contentItems"][0]["text"])
+        self.assertIn("hard effort ceiling is max", response["contentItems"][0]["text"])
+
+        with self.assertRaisesRegex(veyra.VeyraError, "hard effort ceiling is max"):
+            client._command("/attention ultra")
+        client.thread_id = "existing-thread"
+        with self.assertRaisesRegex(veyra.VeyraError, "hard effort ceiling is max"):
+            client.fork("sol", "ultra")
+        with self.assertRaisesRegex(veyra.VeyraError, "hard effort ceiling is max"):
+            veyra.VeyraClient(
+                FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("sol"), "ultra", veyra.Palette(False)
+            )
 
     def test_fork_routes_to_selected_model(self):
         catalogue = veyra.ModelCatalogue(
@@ -1065,6 +1189,174 @@ class ForkTests(unittest.TestCase):
         self.assertNotIn(
             bundle.profiles["gpt-5.6-terra"], params["developerInstructions"]
         )
+
+    def test_background_worker_returns_immediately_with_a_job_id(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server,
+            catalogue,
+            doctrine_bundle(),
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow_worker(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return "finished"
+
+        with patch.object(client, "_run_local_worker", side_effect=slow_worker):
+            with redirect_stdout(io.StringIO()):
+                client._handle_spawn_worker_agent(
+                    20,
+                    {
+                        "model": "luna",
+                        "prompt": "slow bounded extraction",
+                    },
+                )
+            self.assertTrue(started.wait(timeout=1))
+            response = server.calls[-1][1]["result"]
+            self.assertTrue(response["success"])
+            self.assertIn("worker-1", response["contentItems"][0]["text"])
+            self.assertEqual(client.worker_jobs["worker-1"].status, "running")
+            release.set()
+            deadline = time.monotonic() + 1
+            while client.worker_jobs["worker-1"].status == "running":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+        self.assertEqual(client.worker_jobs["worker-1"].status, "completed")
+
+    def test_background_worker_tool_is_exposed_for_worker_only_routes(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        tools = {tool["name"]: tool for tool in client.dynamic_tools()}
+        self.assertIn(veyra.SPAWN_WORKER_AGENT_TOOL, tools)
+        self.assertIn(
+            "return a job id immediately",
+            tools[veyra.SPAWN_WORKER_AGENT_TOOL]["description"],
+        )
+        self.assertIn(veyra.SPAWN_WORKER_AGENT_TOOL, client.developer_instructions)
+
+    def test_background_worker_supports_an_ollama_route(self):
+        catalogue = self.catalogue_with_luna()
+        catalogue.add_local("ollama", ["small-worker"])
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        with patch.object(client, "_background_worker"):
+            job = client._spawn_worker_job(
+                catalogue.resolve("ollama:small-worker"),
+                "medium",
+                "inspect the files",
+            )
+        self.assertEqual(job.target.provider, "ollama")
+        self.assertEqual(job.target.route_id, "ollama:small-worker")
+
+    def test_background_worker_is_read_only_and_uses_its_own_event_queue(self):
+        catalogue = self.catalogue_with_luna()
+        server = RoutedWorkerServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        report = client._run_local_worker(
+            catalogue.resolve("luna"),
+            "medium",
+            "bounded extraction",
+            background=True,
+        )
+        self.assertEqual(report, "worker report")
+        start_params = server.calls[0][1]
+        turn_params = server.calls[1][1]
+        self.assertEqual(start_params["sandbox"], "read-only")
+        self.assertEqual(start_params["approvalPolicy"], "never")
+        self.assertEqual(turn_params["approvalPolicy"], "never")
+        self.assertNotIn("background-thread", server.thread_events)
+
+    def test_completed_background_report_returns_as_standalone_tool_output(self):
+        catalogue = self.catalogue_with_luna()
+        server = TurnServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        job = veyra.WorkerJob(
+            "worker-1",
+            catalogue.resolve("luna"),
+            "medium",
+            "bounded extraction",
+            status="completed",
+            report="stack of papers",
+            started_at=1.0,
+            finished_at=2.0,
+        )
+        client.worker_jobs[job.job_id] = job
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(client._deliver_ready_worker_jobs())
+        method, params = server.calls[-1]
+        self.assertEqual(method, "turn/start")
+        self.assertEqual(params["input"], [])
+        self.assertEqual(
+            params["toolOutput"]["name"], veyra.BACKGROUND_WORKER_RESULT_TOOL
+        )
+        self.assertIn("stack of papers", params["toolOutput"]["output"])
+        self.assertEqual(params["turnTrigger"], "background_worker_completion")
+        self.assertTrue(job.delivered)
+
+    def test_background_report_stays_with_its_parent_thread(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "different-thread"
+        client.worker_jobs["worker-1"] = veyra.WorkerJob(
+            "worker-1",
+            catalogue.resolve("luna"),
+            "medium",
+            "bounded extraction",
+            parent_thread_id="original-thread",
+            status="completed",
+            report="stack of papers",
+        )
+        self.assertFalse(client._deliver_ready_worker_jobs())
+        self.assertFalse(client.worker_jobs["worker-1"].delivered)
+
+    def test_background_worker_can_be_cancelled(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        job = veyra.WorkerJob(
+            "worker-1",
+            catalogue.resolve("luna"),
+            "medium",
+            "bounded extraction",
+            status="running",
+            worker_thread_id="worker-thread",
+            worker_turn_id="worker-turn",
+        )
+        client.worker_jobs[job.job_id] = job
+        with redirect_stdout(io.StringIO()):
+            client._cancel_worker_job(job.job_id)
+        method, params = server.calls[-1]
+        self.assertEqual(method, "turn/interrupt")
+        self.assertEqual(params["threadId"], "worker-thread")
+        self.assertEqual(params["turnId"], "worker-turn")
+        self.assertEqual(job.status, "cancelled")
 
     def test_route_tool_rejects_worker_only_hosted_model(self):
         catalogue = self.catalogue_with_luna()
