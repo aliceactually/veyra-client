@@ -1,8 +1,8 @@
 # Veyra Client
 
 A small, dependency-free terminal client for Codex App Server. It keeps the
-surface deliberately narrow: conversation, model and effort selection, thread
-forking, local workers, token usage, and approval prompts.
+surface deliberately narrow: conversation, atomic cognitive-profile routing,
+thread forking, local workers, token usage, and approval prompts.
 
 It uses the existing Codex CLI authentication and sandbox. It does not read or
 store API keys.
@@ -27,9 +27,11 @@ and `veyra-core` repositories. Override it with `--cwd PATH` when needed.
 By default, Veyra starts on `gpt-5.6-sol` with high reasoning. Veyra's
 coordinating identity is hard-limited to the reviewed hosted routes
 `gpt-5.6-terra` and `gpt-5.6-sol`; every other route, including all local
-models, is worker-only. Coding and nuanced human-interface work remain with
-Sol. Terra is limited to trivial, low-risk, non-coding work; bounded mechanical
-work should normally go to a suitable local worker. Before App Server starts,
+models, is worker-only. Sol handles coding, consequential judgement, durable
+memory and deep interpretation. Terra handles ambient, low-stakes conversation
+and trivial non-coding work, with a startle boundary that requests Sol as scope
+or consequence rises. Bounded mechanical work should normally go to a suitable
+local worker. Before App Server starts,
 the client always runs the
 `veyra-core` fetch and continuity checks. It also discovers models from the
 built-in Ollama and LM Studio providers. Override the core location with `--core PATH` or
@@ -65,12 +67,20 @@ Run a non-generating connection check with:
 - `/quit` - exit
 
 Veyra can also call the client-provided `request_model_route` tool. A route
-requested during a turn takes effect on the next turn because an in-flight
-model invocation cannot be replaced. Cross-provider routes automatically fork
-the current history. The `run_local_agent` tool lets the coordinating model run
-a bounded task on a discovered local model and receive its report. The
-`run_worker_agent` tool does the same on any worker-only route, including a
-lower-capability hosted route, while keeping Veyra on an approved identity host.
+requested during a turn remains pending until the next turn. The client then
+changes model, reasoning effort and route-specific developer instructions as a
+single App Server collaboration-mode setting. If that turn cannot start, the
+old route remains active and the transition stays pending. Cross-provider
+routes automatically fork the current history. The `run_local_agent` tool lets
+the coordinating model run a bounded task on a discovered local model and
+receive its report. The `run_worker_agent` tool does the same on any worker-only
+route, including a lower-capability hosted route, while keeping Veyra on an
+approved identity host.
+
+The public identity and safety doctrine is shared by both routes. Route-specific
+profiles live in `veyra-core/profiles`; worker threads receive an identity-free
+worker profile. Private memories and dialogue corpora remain in Alice-encrypted
+continuity, never in either public repository.
 
 In an interactive terminal, Veyra reserves the bottom row for a compact token
 status bar. The conversation scrolls above it, and the terminal is restored when

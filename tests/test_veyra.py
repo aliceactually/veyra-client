@@ -1,6 +1,8 @@
 import importlib.util
 import io
+import queue
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -93,6 +95,42 @@ class PaletteTests(unittest.TestCase):
 
     def test_terminal_detection_is_independent_of_colour(self):
         self.assertTrue(veyra.Palette(False, terminal=True).terminal)
+
+
+class DoctrineBundleTests(unittest.TestCase):
+    def test_profile_manifest_loads_shared_route_and_identity_free_worker_layers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            (profiles / "manifest.json").write_text(
+                '{"schema":1,"version":"test","models":{'
+                '"gpt-5.6-sol":"sol.md","gpt-5.6-terra":"terra.md"},'
+                '"worker":"worker.md"}'
+            )
+            (profiles / "sol.md").write_text("sol layer")
+            (profiles / "terra.md").write_text("terra layer")
+            (profiles / "worker.md").write_text("bounded worker")
+            bundle = veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles(
+                "shared identity"
+            )
+        self.assertIn("shared identity", bundle.instructions_for("gpt-5.6-sol"))
+        self.assertIn("sol layer", bundle.instructions_for("gpt-5.6-sol"))
+        self.assertNotIn("terra layer", bundle.instructions_for("gpt-5.6-sol"))
+        self.assertEqual(bundle.worker, "bounded worker")
+        self.assertNotIn("shared identity", bundle.worker)
+
+    def test_profile_manifest_must_cover_both_approved_hosts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            (profiles / "manifest.json").write_text(
+                '{"schema":1,"models":{"gpt-5.6-sol":"sol.md"},'
+                '"worker":"worker.md"}'
+            )
+            with self.assertRaisesRegex(veyra.VeyraError, "every approved host"):
+                veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles("shared")
 
 
 class MainTests(unittest.TestCase):
@@ -322,7 +360,7 @@ class ForkTests(unittest.TestCase):
         )
         self.assertIn("use Sol high or above", client.developer_instructions)
 
-    def test_default_route_reserves_terra_for_trivial_non_coding_work(self):
+    def test_default_route_and_terra_ambient_boundary(self):
         args = veyra.parse_args([])
         self.assertEqual(args.model, "gpt-5.6-sol")
         self.assertEqual(args.effort, "high")
@@ -337,9 +375,9 @@ class ForkTests(unittest.TestCase):
             "medium",
             veyra.Palette(False),
         )
-        self.assertIn("Sol high is the normal substrate", client.developer_instructions)
-        self.assertIn("Terra is exceptional", client.developer_instructions)
-        self.assertIn("nuanced human-interface work", client.developer_instructions)
+        self.assertIn("Sol high is required", client.developer_instructions)
+        self.assertIn("ambient, low-stakes conversation", client.developer_instructions)
+        self.assertIn("Terra must request Sol", client.developer_instructions)
 
     def test_fork_routes_to_selected_model(self):
         catalogue = veyra.ModelCatalogue(
@@ -422,9 +460,68 @@ class ForkTests(unittest.TestCase):
                     },
                 },
             )
+        self.assertEqual(client.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
+        self.assertEqual(client.pending_route.effort, "high")
+        self.assertTrue(server.calls[-1][1]["result"]["success"])
+
+    def test_route_profile_changes_atomically_with_model_and_effort(self):
+        catalogue = self.catalogue_with_sol()
+        server = TurnServer()
+        bundle = veyra.DoctrineBundle(
+            shared="shared identity",
+            profiles={
+                "gpt-5.6-terra": "terra profile",
+                "gpt-5.6-sol": "sol profile",
+            },
+            worker="worker without identity",
+            version="test",
+        )
+        client = veyra.VeyraClient(
+            server, catalogue, bundle, Path.cwd(), catalogue.resolve("terra"),
+            "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        client._schedule_route(catalogue.resolve("sol"), "high", "startled")
+        client.run_turn("Do the consequential work")
         self.assertEqual(client.model.model_id, "gpt-5.6-sol")
         self.assertEqual(client.effort, "high")
-        self.assertTrue(server.calls[-1][1]["result"]["success"])
+        self.assertIsNone(client.pending_route)
+        _, params = server.calls[-1]
+        settings = params["collaborationMode"]["settings"]
+        self.assertEqual(settings["model"], "gpt-5.6-sol")
+        self.assertEqual(settings["reasoning_effort"], "high")
+        self.assertIn("shared identity", settings["developer_instructions"])
+        self.assertIn("sol profile", settings["developer_instructions"])
+        self.assertNotIn("terra profile", settings["developer_instructions"])
+
+    def test_failed_turn_keeps_active_route_and_pending_transition(self):
+        catalogue = self.catalogue_with_sol()
+        server = FailingTurnServer()
+        client = veyra.VeyraClient(
+            server, catalogue, "doctrine", Path.cwd(), catalogue.resolve("terra"),
+            "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        client._schedule_route(catalogue.resolve("sol"), "high", "startled")
+        with self.assertRaisesRegex(veyra.VeyraError, "simulated failure"):
+            client.run_turn("trigger")
+        self.assertEqual(client.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
+
+    def test_rejects_overlapping_turns(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, "doctrine", Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.turn_active = True
+        with self.assertRaisesRegex(veyra.VeyraError, "active turn"):
+            client.run_turn("overlap")
 
     def test_rejects_local_model_as_veyra_host(self):
         catalogue = veyra.ModelCatalogue(
@@ -530,6 +627,52 @@ class ForkTests(unittest.TestCase):
                 },
             ]
         )
+
+    @staticmethod
+    def catalogue_with_sol():
+        return veyra.ModelCatalogue(
+            [
+                {
+                    "id": "gpt-5.6-terra", "model": "gpt-5.6-terra",
+                    "displayName": "Terra", "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+                },
+                {
+                    "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                    "displayName": "Sol", "defaultReasoningEffort": "high",
+                    "supportedReasoningEfforts": [{"reasoningEffort": "high"}],
+                },
+            ]
+        )
+
+
+class TurnServer(FakeServer):
+    def __init__(self):
+        super().__init__()
+        self.events = queue.Queue()
+
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "turn/start":
+            self.events.put(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turn": {"id": "turn", "status": "completed"},
+                    },
+                }
+            )
+            return {"turn": {"id": "turn"}}
+        return {"thread": {"id": "thread"}}
+
+
+class FailingTurnServer(FakeServer):
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "turn/start":
+            raise veyra.VeyraError("simulated failure")
+        return {"thread": {"id": "thread"}}
 
 
 if __name__ == "__main__":

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 
-CLIENT_VERSION = "0.2.7"
+CLIENT_VERSION = "0.3.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "high"
 APPROVAL_POLICY = "on-request"
@@ -276,6 +276,42 @@ class Model:
         return f"{self.provider}:{self.model_id}"
 
 
+@dataclass(frozen=True)
+class PendingRoute:
+    model: Model
+    effort: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class DoctrineBundle:
+    """Shared Veyra doctrine plus model-specific and identity-free profiles."""
+
+    shared: str
+    profiles: dict[str, str]
+    worker: str
+    version: str = "legacy"
+
+    @classmethod
+    def legacy(cls, doctrine: str) -> DoctrineBundle:
+        return cls(
+            shared=doctrine,
+            profiles={model_id: "" for model_id in VEYRA_HOST_MODELS},
+            worker=(
+                "You are a bounded worker reporting to Veyra, not Veyra herself. "
+                "Complete only the supplied task and return a concise, "
+                "evidence-based report."
+            ),
+        )
+
+    def instructions_for(self, model_id: str) -> str:
+        try:
+            profile = self.profiles[model_id]
+        except KeyError as exc:
+            raise VeyraError(f"no cognitive profile for approved host: {model_id}") from exc
+        return self.shared.rstrip() + "\n\n" + profile.strip() + "\n"
+
+
 @dataclass
 class WorkerStats:
     calls: int = 0
@@ -396,7 +432,7 @@ class ContinuityGate:
         self.core = core.resolve()
         self.palette = palette
 
-    def verify(self) -> str:
+    def verify(self) -> DoctrineBundle:
         fetch = self.core / "scripts" / "fetch-core.sh"
         state = self.core / "scripts" / "continuity-state.py"
         wake = self.core / "scripts" / "wake-state.py"
@@ -471,7 +507,47 @@ class ContinuityGate:
                 check=False,
             )
         doctrine = (self.core / "AGENTS.md").read_text(encoding="utf-8")
-        return doctrine + bootstrap_note + "\n"
+        shared = doctrine + bootstrap_note + "\n"
+        return self._load_profiles(shared)
+
+    def _load_profiles(self, shared: str) -> DoctrineBundle:
+        profile_root = self.core / "profiles"
+        manifest_path = profile_root / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise VeyraError("Veyra core is missing profiles/manifest.json") from exc
+        except json.JSONDecodeError as exc:
+            raise VeyraError("Veyra profile manifest is malformed") from exc
+        if manifest.get("schema") != 1:
+            raise VeyraError("unsupported Veyra profile manifest schema")
+        model_files = manifest.get("models")
+        if not isinstance(model_files, dict) or set(model_files) != VEYRA_HOST_MODELS:
+            raise VeyraError("Veyra profile manifest must cover every approved host")
+
+        def read_profile(filename: Any) -> str:
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise VeyraError("Veyra profile paths must be simple filenames")
+            path = profile_root / filename
+            try:
+                content = path.read_text(encoding="ascii")
+            except (FileNotFoundError, UnicodeDecodeError) as exc:
+                raise VeyraError(f"invalid Veyra profile: {filename}") from exc
+            if not content.strip():
+                raise VeyraError(f"empty Veyra profile: {filename}")
+            return content
+
+        profiles = {
+            model_id: read_profile(filename)
+            for model_id, filename in model_files.items()
+        }
+        worker = read_profile(manifest.get("worker"))
+        return DoctrineBundle(
+            shared=shared,
+            profiles=profiles,
+            worker=worker,
+            version=str(manifest.get("version") or "unversioned"),
+        )
 
 
 class VeyraClient:
@@ -479,7 +555,7 @@ class VeyraClient:
         self,
         server: AppServer,
         catalogue: ModelCatalogue,
-        doctrine: str,
+        doctrine: DoctrineBundle | str,
         cwd: Path,
         model: Model,
         effort: str,
@@ -489,11 +565,16 @@ class VeyraClient:
     ):
         self.server = server
         self.catalogue = catalogue
-        self.doctrine = doctrine
+        self.doctrine = (
+            doctrine
+            if isinstance(doctrine, DoctrineBundle)
+            else DoctrineBundle.legacy(doctrine)
+        )
         self.cwd = cwd.resolve()
         self._require_veyra_host(model)
         self.model = model
         self.effort = catalogue.validate_effort(model, effort)
+        self.pending_route: PendingRoute | None = None
         self.palette = palette
         self.approvals_reviewer = approvals_reviewer
         self.debug = debug
@@ -519,6 +600,9 @@ class VeyraClient:
 
     @property
     def developer_instructions(self) -> str:
+        return self.instructions_for(self.model)
+
+    def instructions_for(self, model: Model) -> str:
         local_guidance = ""
         if self.catalogue.local_models:
             local_guidance = (
@@ -528,23 +612,23 @@ class VeyraClient:
                 "Treat local-worker output as advisory and verify consequential results."
             )
         return (
-            self.doctrine
+            self.doctrine.instructions_for(model.model_id)
             + "\n\n# Harness routing\n\n"
             + "You are running inside Veyra Client. Use the client tool "
             + f"`{ROUTE_TOOL}` only when a later turn genuinely warrants a different "
             + "model or reasoning effort. Veyra herself may only run on the approved "
             + "hosted identity routes gpt-5.6-terra and gpt-5.6-sol; local and all "
-            + "other routes are worker-only. Sol high is the normal substrate for "
-            + "coding, consequential judgement and nuanced human-interface work. "
-            + "Terra is exceptional: use it only for genuinely trivial, low-risk, "
-            + "non-coding work with an immediately verifiable result, and prefer a "
-            + "suitable local D-Class worker when its output can be checked cheaply. "
-            + "Do not downgrade work merely because it is short or conversational. "
+            + "other routes are worker-only. Sol high is required for coding, "
+            + "consequential judgement, durable memory and deep human-interface "
+            + "work. Terra is Veyra's lighter profile for ambient, low-stakes "
+            + "conversation and trivial non-coding work. Terra must request Sol "
+            + "when stakes, ambiguity or scope rise. "
             + "An explicit request to commit or checkpoint "
             + "code together with continuity or memories is consequential by default: "
             + "use Sol high or above for the committing turn. Give a concise reason. "
             + "A requested route "
-            + "takes effect on the next turn. Never treat model routing as permission "
+            + "takes effect atomically on the next turn. Never treat model routing "
+            + "as permission "
             + "to bypass sandbox or approval boundaries."
             + local_guidance
             + "\n"
@@ -558,8 +642,9 @@ class VeyraClient:
                 "description": (
                     "Request a model and reasoning-effort route for subsequent turns. "
                     "Veyra may only use gpt-5.6-terra or gpt-5.6-sol. Use Sol for "
-                    "coding and human-interface judgement; Terra is limited to "
-                    "trivial, low-risk, non-coding work."
+                    "coding, consequential judgement, durable memory and deep "
+                    "interpretation; Terra is for ambient low-stakes conversation "
+                    "and trivial non-coding work."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -654,17 +739,20 @@ class VeyraClient:
         return tools
 
     def start_thread(self, ephemeral: bool = False) -> None:
-        self._require_veyra_host(self.model)
+        route = self.pending_route or PendingRoute(
+            self.model, self.effort, "active route"
+        )
+        self._require_veyra_host(route.model)
         result = self.server.request(
             "thread/start",
             {
-                "model": self.model.model_id,
-                "modelProvider": self.model.provider,
+                "model": route.model.model_id,
+                "modelProvider": route.model.provider,
                 "cwd": str(self.cwd),
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
-                "developerInstructions": self.developer_instructions,
+                "developerInstructions": self.instructions_for(route.model),
                 "dynamicTools": self.dynamic_tools(),
                 "serviceName": "veyra_client",
                 "allowProviderModelFallback": False,
@@ -672,7 +760,7 @@ class VeyraClient:
             },
         )
         self.thread_id = result["thread"]["id"]
-        self.thread_provider = self.model.provider
+        self.thread_provider = route.model.provider
 
     def fork(
         self, model_name: str | None, effort: str | None, ephemeral: bool = False
@@ -697,7 +785,7 @@ class VeyraClient:
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
-                "developerInstructions": self.developer_instructions,
+                "developerInstructions": self.instructions_for(target),
                 "ephemeral": ephemeral,
             },
         )
@@ -705,6 +793,7 @@ class VeyraClient:
         self.thread_provider = target.provider
         self.model = target
         self.effort = target_effort
+        self.pending_route = None
         self.latest_usage = None
         print(self.palette.dim(f"forked -> {self.thread_id}"))
 
@@ -719,7 +808,6 @@ class VeyraClient:
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
-                "developerInstructions": self.developer_instructions,
                 "excludeTurns": True,
             },
         )
@@ -746,6 +834,7 @@ class VeyraClient:
         )
         if reported_effort:
             self.effort = self.catalogue.validate_effort(self.model, reported_effort)
+        self.pending_route = None
         self.latest_usage = None
         print(self.palette.dim(f"resumed -> {self.thread_id}"))
 
@@ -771,23 +860,37 @@ class VeyraClient:
             print(f"{marker} {thread.get('id')}  {route}  {preview}")
 
     def run_turn(self, text: str) -> None:
-        self._require_veyra_host(self.model)
+        if self.turn_active:
+            raise VeyraError("wait for the active turn before starting another")
+        route = self.pending_route or PendingRoute(
+            self.model, self.effort, "active route"
+        )
+        self._require_veyra_host(route.model)
         if not self.thread_id:
             self.start_thread()
-        elif self.thread_provider != self.model.provider:
-            self.fork(self.model.route_id, self.effort)
+        elif self.thread_provider != route.model.provider:
+            self.fork(route.model.route_id, route.effort)
         result = self.server.request(
             "turn/start",
             {
                 "threadId": self.thread_id,
                 "input": [{"type": "text", "text": text}],
-                "model": self.model.model_id,
-                "effort": self.effort,
+                "collaborationMode": {
+                    "mode": "default",
+                    "settings": {
+                        "model": route.model.model_id,
+                        "reasoning_effort": route.effort,
+                        "developer_instructions": self.instructions_for(route.model),
+                    },
+                },
                 "cwd": str(self.cwd),
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
             },
         )
+        self.model = route.model
+        self.effort = route.effort
+        self.pending_route = None
         turn_id = result["turn"]["id"]
         self.turn_active = True
         wrote_agent_text = False
@@ -972,13 +1075,17 @@ class VeyraClient:
             reason = str(arguments.get("reason", "")).strip()
             if not reason:
                 raise VeyraError("a routing reason is required")
-            self.model = target
-            self.effort = effort
+            self._schedule_route(target, effort, reason)
             text = f"Scheduled {target.route_id}/{effort} for the next turn: {reason}"
             print(self.palette.dim(f"\n[route] {text}"))
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
             self._tool_response(request_id, False, f"Route rejected: {exc}")
+
+    def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
+        self._require_veyra_host(target)
+        validated = self.catalogue.validate_effort(target, effort)
+        self.pending_route = PendingRoute(target, validated, reason)
 
     def _handle_local_agent(
         self, request_id: Any, arguments: dict[str, Any]
@@ -1035,10 +1142,7 @@ class VeyraClient:
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
                 "developerInstructions": (
-                    self.doctrine
-                    + "\n\nYou are a bounded local worker reporting to Veyra. Complete "
-                    "only the supplied task. Do not broaden its scope or make final "
-                    "consequential decisions. Return a concise, evidence-based report.\n"
+                    self.doctrine.worker.rstrip() + "\n"
                 ),
                 "ephemeral": True,
                 "serviceName": "veyra_client_local_worker",
@@ -1173,29 +1277,35 @@ class VeyraClient:
                 "/quit                 exit"
             )
         elif command == "/models":
+            selected = self.pending_route.model if self.pending_route else self.model
             for model in self.catalogue.models:
                 if not model.local and model.model_id not in VEYRA_HOST_MODELS:
                     continue
-                marker = "*" if model.route_id == self.model.route_id else " "
+                marker = "*" if model.route_id == selected.route_id else " "
                 efforts = ", ".join(model.efforts) or "provider-defined"
                 location = "worker-only" if model.local else "Veyra host"
                 print(f"{marker} {model.route_id}: {efforts} [{location}]")
         elif command == "/model":
             if not args:
-                print(self.model.route_id)
+                selected = self.pending_route.model if self.pending_route else self.model
+                print(selected.route_id)
             else:
                 target = self.catalogue.resolve(" ".join(args))
                 self._require_veyra_host(target)
-                self.model = target
-                if target.efforts and self.effort not in target.efforts:
-                    self.effort = target.default_effort
-                print(self.palette.dim(f"next turn -> {self.model.route_id}/{self.effort}"))
+                effort = self.pending_route.effort if self.pending_route else self.effort
+                if target.efforts and effort not in target.efforts:
+                    effort = target.default_effort
+                self._schedule_route(target, effort, "manual model selection")
+                print(self.palette.dim(f"next turn -> {target.route_id}/{effort}"))
         elif command == "/effort":
             if not args:
-                print(self.effort)
+                effort = self.pending_route.effort if self.pending_route else self.effort
+                print(effort)
             else:
-                self.effort = self.catalogue.validate_effort(self.model, args[0])
-                print(self.palette.dim(f"next turn -> {self.model.route_id}/{self.effort}"))
+                target = self.pending_route.model if self.pending_route else self.model
+                effort = self.catalogue.validate_effort(target, args[0])
+                self._schedule_route(target, effort, "manual effort selection")
+                print(self.palette.dim(f"next turn -> {target.route_id}/{effort}"))
         elif command == "/local":
             if len(args) < 2:
                 raise VeyraError("usage: /local MODEL PROMPT")
@@ -1239,6 +1349,9 @@ class VeyraClient:
             print(f"thread: {self.thread_id}")
             print(f"cwd: {self.cwd}")
             print(f"route: {self.model.route_id}/{self.effort}")
+            if self.pending_route:
+                pending = self.pending_route
+                print(f"pending: {pending.model.route_id}/{pending.effort} ({pending.reason})")
         elif command == "/usage":
             self._show_usage()
         elif command == "/workers":
