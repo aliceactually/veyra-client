@@ -17,6 +17,18 @@ sys.modules[SPEC.name] = veyra
 SPEC.loader.exec_module(veyra)
 
 
+def doctrine_bundle(version="test"):
+    return veyra.DoctrineBundle(
+        shared="shared identity doctrine",
+        profiles={
+            "gpt-5.6-terra": "terra cognitive profile",
+            "gpt-5.6-sol": "sol cognitive profile",
+        },
+        worker="bounded worker without Veyra identity",
+        version=version,
+    )
+
+
 class ModelCatalogueTests(unittest.TestCase):
     def setUp(self):
         self.catalogue = veyra.ModelCatalogue(
@@ -98,6 +110,15 @@ class PaletteTests(unittest.TestCase):
 
 
 class DoctrineBundleTests(unittest.TestCase):
+    def test_bundle_profiles_are_immutable_after_validation(self):
+        bundle = doctrine_bundle()
+        with self.assertRaises(TypeError):
+            bundle.profiles["gpt-5.6-sol"] = "replacement profile"
+
+    def test_bundle_rejects_an_unsafe_attestation_version(self):
+        with self.assertRaisesRegex(veyra.VeyraError, "safe identifier"):
+            doctrine_bundle(version="test\nInjected instruction")
+
     def test_profile_manifest_loads_shared_route_and_identity_free_worker_layers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -126,11 +147,28 @@ class DoctrineBundleTests(unittest.TestCase):
             profiles = root / "profiles"
             profiles.mkdir()
             (profiles / "manifest.json").write_text(
-                '{"schema":1,"models":{"gpt-5.6-sol":"sol.md"},'
-                '"worker":"worker.md"}'
+                '{"schema":1,"version":"test","models":{'
+                '"gpt-5.6-sol":"sol.md"},"worker":"worker.md"}'
             )
             with self.assertRaisesRegex(veyra.VeyraError, "every approved host"):
-                veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles("shared")
+                veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles(
+                    "shared"
+                )
+
+    def test_profile_manifest_requires_a_non_empty_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profiles = root / "profiles"
+            profiles.mkdir()
+            (profiles / "manifest.json").write_text(
+                '{"schema":1,"version":"","models":{'
+                '"gpt-5.6-sol":"sol.md","gpt-5.6-terra":"terra.md"},'
+                '"worker":"worker.md"}'
+            )
+            with self.assertRaisesRegex(veyra.VeyraError, "non-empty version"):
+                veyra.ContinuityGate(root, veyra.Palette(False))._load_profiles(
+                    "shared"
+                )
 
 
 class MainTests(unittest.TestCase):
@@ -208,13 +246,23 @@ class TokenStatTests(unittest.TestCase):
             ]
         )
         client = veyra.VeyraClient(
-            FakeServer(), catalogue, "doctrine", Path.cwd(), catalogue.resolve("terra"),
+            FakeServer(),
+            catalogue,
+            doctrine_bundle(),
+            Path.cwd(),
+            catalogue.resolve("terra"),
             "medium", veyra.Palette(False)
         )
         worker = catalogue.resolve("sol")
         client._record_worker_stats(
             worker,
-            {"last": {"totalTokens": 100, "outputTokens": 40, "reasoningOutputTokens": 20}},
+            {
+                "last": {
+                    "totalTokens": 100,
+                    "outputTokens": 40,
+                    "reasoningOutputTokens": 20,
+                }
+            },
             2.0,
         )
         stats = client.worker_stats[worker.route_id]
@@ -225,7 +273,7 @@ class TokenStatTests(unittest.TestCase):
 
     def test_status_bar_reserves_and_updates_the_bottom_row(self):
         client = veyra.VeyraClient(
-            FakeServer(), self.catalogue(), "doctrine", Path.cwd(),
+            FakeServer(), self.catalogue(), doctrine_bundle(), Path.cwd(),
             self.catalogue().resolve("terra"), "medium", veyra.Palette(True)
         )
         output = io.StringIO()
@@ -247,7 +295,7 @@ class TokenStatTests(unittest.TestCase):
 
     def test_stopping_terminal_ui_restores_the_terminal(self):
         client = veyra.VeyraClient(
-            FakeServer(), self.catalogue(), "doctrine", Path.cwd(),
+            FakeServer(), self.catalogue(), doctrine_bundle(), Path.cwd(),
             self.catalogue().resolve("terra"), "medium", veyra.Palette(True)
         )
         output = io.StringIO()
@@ -269,7 +317,7 @@ class TokenStatTests(unittest.TestCase):
     @unittest.skipIf(veyra.readline is None, "readline is unavailable")
     def test_resize_moves_the_reserved_row_and_redraws_status(self):
         client = veyra.VeyraClient(
-            FakeServer(), self.catalogue(), "doctrine", Path.cwd(),
+            FakeServer(), self.catalogue(), doctrine_bundle(), Path.cwd(),
             self.catalogue().resolve("terra"), "medium", veyra.Palette(True)
         )
         output = io.StringIO()
@@ -316,13 +364,26 @@ class FakeServer:
 
 
 class ForkTests(unittest.TestCase):
+    def test_constructor_rejects_plain_doctrine_text(self):
+        catalogue = self.catalogue_with_luna()
+        with self.assertRaisesRegex(veyra.VeyraError, "versioned DoctrineBundle"):
+            veyra.VeyraClient(
+                FakeServer(),
+                catalogue,
+                "plain doctrine",
+                Path.cwd(),
+                catalogue.resolve("terra"),
+                "medium",
+                veyra.Palette(False),
+            )
+
     def test_new_threads_use_automatic_approval_review(self):
         catalogue = self.catalogue_with_luna()
         server = FakeServer()
         client = veyra.VeyraClient(
             server,
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -348,7 +409,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             FakeServer(),
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -369,7 +430,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             FakeServer(),
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -402,7 +463,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             server,
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -442,7 +503,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             server,
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -464,7 +525,49 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(client.effort, "medium")
         self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
         self.assertEqual(client.pending_route.effort, "high")
+        self.assertEqual(client.pending_route.profile_version, "test")
         self.assertTrue(server.calls[-1][1]["result"]["success"])
+
+    def test_manual_model_and_effort_changes_remain_pending(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(),
+            catalogue,
+            doctrine_bundle(),
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        with redirect_stdout(io.StringIO()):
+            client._command("/model sol")
+            client._command("/effort high")
+        self.assertEqual(client.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.active_profile_version, "test")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
+        self.assertEqual(client.pending_route.effort, "high")
+        self.assertEqual(client.pending_route.profile_version, "test")
+
+    def test_thread_command_displays_active_and_pending_profile_state(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(),
+            catalogue,
+            doctrine_bundle(version="test.2"),
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        client._schedule_route(catalogue.resolve("sol"), "high", "startled")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            client._command("/thread")
+        rendered = output.getvalue()
+        self.assertIn("profile: test.2", rendered)
+        self.assertIn("route reason: initial route", rendered)
+        self.assertIn("pending: gpt-5.6-sol/high profile test.2 (startled)", rendered)
 
     def test_route_profile_changes_atomically_with_model_and_effort(self):
         catalogue = self.catalogue_with_sol()
@@ -485,9 +588,12 @@ class ForkTests(unittest.TestCase):
         client.thread_id = "thread"
         client.thread_provider = "openai"
         client._schedule_route(catalogue.resolve("sol"), "high", "startled")
-        client.run_turn("Do the consequential work")
+        with redirect_stdout(io.StringIO()):
+            client.run_turn("Do the consequential work")
         self.assertEqual(client.model.model_id, "gpt-5.6-sol")
         self.assertEqual(client.effort, "high")
+        self.assertEqual(client.active_profile_version, "test")
+        self.assertEqual(client.active_route_reason, "startled")
         self.assertIsNone(client.pending_route)
         _, params = server.calls[-1]
         settings = params["collaborationMode"]["settings"]
@@ -496,12 +602,49 @@ class ForkTests(unittest.TestCase):
         self.assertIn("shared identity", settings["developer_instructions"])
         self.assertIn("sol profile", settings["developer_instructions"])
         self.assertNotIn("terra profile", settings["developer_instructions"])
+        self.assertIn(
+            "Host profile: gpt-5.6-sol", settings["developer_instructions"]
+        )
+        self.assertIn("Profile version: test", settings["developer_instructions"])
+
+    def test_resume_reconciles_the_reported_route_with_the_current_profile(self):
+        catalogue = self.catalogue_with_sol()
+        server = ResumeTurnServer()
+        client = veyra.VeyraClient(
+            server,
+            catalogue,
+            doctrine_bundle(version="test.2"),
+            Path.cwd(),
+            catalogue.resolve("sol"),
+            "high",
+            veyra.Palette(False),
+        )
+        with redirect_stdout(io.StringIO()):
+            client.resume("resumed-thread")
+        self.assertEqual(client.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.effort, "medium")
+        self.assertIsNone(client.active_profile_version)
+        self.assertEqual(client.pending_route.profile_version, "test.2")
+        with redirect_stdout(io.StringIO()):
+            client.run_turn("Continue")
+        self.assertEqual(client.active_profile_version, "test.2")
+        self.assertIsNone(client.pending_route)
+        _, params = server.calls[-1]
+        settings = params["collaborationMode"]["settings"]
+        self.assertEqual(settings["model"], "gpt-5.6-terra")
+        self.assertEqual(settings["reasoning_effort"], "medium")
+        self.assertIn("terra cognitive profile", settings["developer_instructions"])
+        self.assertIn("Profile version: test.2", settings["developer_instructions"])
 
     def test_failed_turn_keeps_active_route_and_pending_transition(self):
         catalogue = self.catalogue_with_sol()
         server = FailingTurnServer()
         client = veyra.VeyraClient(
-            server, catalogue, "doctrine", Path.cwd(), catalogue.resolve("terra"),
+            server,
+            catalogue,
+            doctrine_bundle(),
+            Path.cwd(),
+            catalogue.resolve("terra"),
             "medium", veyra.Palette(False)
         )
         client.thread_id = "thread"
@@ -513,10 +656,31 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(client.effort, "medium")
         self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
 
+    def test_malformed_turn_response_keeps_the_pending_transition(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            MalformedTurnServer(),
+            catalogue,
+            doctrine_bundle(),
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        client._schedule_route(catalogue.resolve("sol"), "high", "startled")
+        with self.assertRaisesRegex(veyra.VeyraError, "usable turn id"):
+            client.run_turn("trigger")
+        self.assertEqual(client.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.active_profile_version, "test")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
+
     def test_rejects_overlapping_turns(self):
         catalogue = self.catalogue_with_sol()
         client = veyra.VeyraClient(
-            FakeServer(), catalogue, "doctrine", Path.cwd(),
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
             catalogue.resolve("terra"), "medium", veyra.Palette(False)
         )
         client.turn_active = True
@@ -539,7 +703,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             FakeServer(),
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -564,7 +728,7 @@ class ForkTests(unittest.TestCase):
             veyra.VeyraClient(
                 FakeServer(),
                 catalogue,
-                "doctrine",
+                doctrine_bundle(),
                 Path.cwd(),
                 catalogue.resolve("luna"),
                 "medium",
@@ -577,7 +741,7 @@ class ForkTests(unittest.TestCase):
         client = veyra.VeyraClient(
             server,
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -588,13 +752,43 @@ class ForkTests(unittest.TestCase):
         )
         self.assertFalse(server.calls[-1][1]["result"]["success"])
 
+    def test_worker_thread_receives_only_the_identity_free_profile(self):
+        catalogue = self.catalogue_with_luna()
+        server = FailingWorkerTurnServer()
+        bundle = doctrine_bundle()
+        client = veyra.VeyraClient(
+            server,
+            catalogue,
+            bundle,
+            Path.cwd(),
+            catalogue.resolve("terra"),
+            "medium",
+            veyra.Palette(False),
+        )
+        with (
+            self.assertRaisesRegex(veyra.VeyraError, "stop after worker payload"),
+            redirect_stdout(io.StringIO()),
+        ):
+            client._run_local_worker(
+                catalogue.resolve("luna"), "medium", "bounded extraction"
+            )
+        method, params = server.calls[0]
+        self.assertEqual(method, "thread/start")
+        self.assertEqual(
+            params["developerInstructions"], bundle.worker.rstrip() + "\n"
+        )
+        self.assertNotIn(bundle.shared, params["developerInstructions"])
+        self.assertNotIn(
+            bundle.profiles["gpt-5.6-terra"], params["developerInstructions"]
+        )
+
     def test_route_tool_rejects_worker_only_hosted_model(self):
         catalogue = self.catalogue_with_luna()
         server = FakeServer()
         client = veyra.VeyraClient(
             server,
             catalogue,
-            "doctrine",
+            doctrine_bundle(),
             Path.cwd(),
             catalogue.resolve("terra"),
             "medium",
@@ -664,6 +858,37 @@ class TurnServer(FakeServer):
                 }
             )
             return {"turn": {"id": "turn"}}
+        return {"thread": {"id": "thread"}}
+
+
+class ResumeTurnServer(TurnServer):
+    def request(self, method, params):
+        if method == "thread/resume":
+            self.calls.append((method, params))
+            return {
+                "model": "gpt-5.6-terra",
+                "modelProvider": "openai",
+                "reasoningEffort": "medium",
+                "thread": {"id": "resumed-thread"},
+            }
+        return super().request(method, params)
+
+
+class FailingWorkerTurnServer(FakeServer):
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "thread/start":
+            return {"thread": {"id": "worker-thread"}}
+        if method == "turn/start":
+            raise veyra.VeyraError("stop after worker payload")
+        raise AssertionError(f"unexpected method: {method}")
+
+
+class MalformedTurnServer(FakeServer):
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "turn/start":
+            return {"turn": {}}
         return {"thread": {"id": "thread"}}
 
 

@@ -34,8 +34,8 @@ or consequence rises. Bounded mechanical work should normally go to a suitable
 local worker. Before App Server starts,
 the client always runs the
 `veyra-core` fetch and continuity checks. It also discovers models from the
-built-in Ollama and LM Studio providers. Override the core location with `--core PATH` or
-`VEYRA_CORE_REPO`; use `--no-local` to disable local discovery.
+built-in Ollama and LM Studio providers. Override the core location with
+`--core PATH` or `VEYRA_CORE_REPO`; use `--no-local` to disable local discovery.
 
 Approval requests use Codex automatic review by default. Routine sandbox
 escapes such as protected Git metadata, networked GitHub operations and work in
@@ -69,9 +69,13 @@ Run a non-generating connection check with:
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then
 changes model, reasoning effort and route-specific developer instructions as a
-single App Server collaboration-mode setting. If that turn cannot start, the
-old route remains active and the transition stays pending. Cross-provider
-routes automatically fork the current history. The `run_local_agent` tool lets
+single App Server collaboration-mode setting. Every transition is bound to a
+non-empty profile version, exposed by `/thread`, and included in the developer
+instruction attestation. If that turn cannot start, the old route remains
+active and the transition stays pending. Resumed threads reconcile their
+reported model and effort with the current profile on the next turn.
+Cross-provider routes automatically fork the current history. The
+`run_local_agent` tool lets
 the coordinating model run a bounded task on a discovered local model and
 receive its report. The `run_worker_agent` tool does the same on any worker-only
 route, including a lower-capability hosted route, while keeping Veyra on an

@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 import queue
+import re
 import signal
 try:
     # Explicitly enable editable input and terminal history where Python ships
@@ -23,8 +24,10 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 
@@ -37,6 +40,7 @@ SANDBOX_MODE = "workspace-write"
 # Veyra's coordinating identity may only run on these reviewed hosted routes.
 # Every other route, including discovered local models, is worker-only.
 VEYRA_HOST_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
+PROFILE_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 ROUTE_TOOL = "request_model_route"
 LOCAL_AGENT_TOOL = "run_local_agent"
 WORKER_AGENT_TOOL = "run_worker_agent"
@@ -281,6 +285,7 @@ class PendingRoute:
     model: Model
     effort: str
     reason: str
+    profile_version: str
 
 
 @dataclass(frozen=True)
@@ -288,21 +293,29 @@ class DoctrineBundle:
     """Shared Veyra doctrine plus model-specific and identity-free profiles."""
 
     shared: str
-    profiles: dict[str, str]
+    profiles: Mapping[str, str]
     worker: str
-    version: str = "legacy"
+    version: str
 
-    @classmethod
-    def legacy(cls, doctrine: str) -> DoctrineBundle:
-        return cls(
-            shared=doctrine,
-            profiles={model_id: "" for model_id in VEYRA_HOST_MODELS},
-            worker=(
-                "You are a bounded worker reporting to Veyra, not Veyra herself. "
-                "Complete only the supplied task and return a concise, "
-                "evidence-based report."
-            ),
-        )
+    def __post_init__(self) -> None:
+        if not isinstance(self.shared, str) or not self.shared.strip():
+            raise VeyraError("Veyra's shared identity doctrine must not be empty")
+        if not isinstance(self.version, str) or not self.version.strip():
+            raise VeyraError("Veyra cognitive profile version must not be empty")
+        object.__setattr__(self, "version", self.version.strip())
+        if not PROFILE_VERSION_PATTERN.fullmatch(self.version):
+            raise VeyraError("Veyra cognitive profile version must be a safe identifier")
+        if (
+            not isinstance(self.profiles, Mapping)
+            or set(self.profiles) != VEYRA_HOST_MODELS
+        ):
+            raise VeyraError("Veyra doctrine must cover every approved host")
+        for model_id, profile in self.profiles.items():
+            if not isinstance(profile, str) or not profile.strip():
+                raise VeyraError(f"empty Veyra cognitive profile: {model_id}")
+        object.__setattr__(self, "profiles", MappingProxyType(dict(self.profiles)))
+        if not isinstance(self.worker, str) or not self.worker.strip():
+            raise VeyraError("Veyra's identity-free worker profile must not be empty")
 
     def instructions_for(self, model_id: str) -> str:
         try:
@@ -519,11 +532,19 @@ class ContinuityGate:
             raise VeyraError("Veyra core is missing profiles/manifest.json") from exc
         except json.JSONDecodeError as exc:
             raise VeyraError("Veyra profile manifest is malformed") from exc
+        if not isinstance(manifest, dict):
+            raise VeyraError("Veyra profile manifest must be a JSON object")
         if manifest.get("schema") != 1:
             raise VeyraError("unsupported Veyra profile manifest schema")
+        version = manifest.get("version")
+        if not isinstance(version, str) or not version.strip():
+            raise VeyraError("Veyra profile manifest requires a non-empty version")
         model_files = manifest.get("models")
         if not isinstance(model_files, dict) or set(model_files) != VEYRA_HOST_MODELS:
             raise VeyraError("Veyra profile manifest must cover every approved host")
+        worker_file = manifest.get("worker")
+        if worker_file in model_files.values():
+            raise VeyraError("Veyra worker profile must use a distinct file")
 
         def read_profile(filename: Any) -> str:
             if not isinstance(filename, str) or Path(filename).name != filename:
@@ -541,12 +562,12 @@ class ContinuityGate:
             model_id: read_profile(filename)
             for model_id, filename in model_files.items()
         }
-        worker = read_profile(manifest.get("worker"))
+        worker = read_profile(worker_file)
         return DoctrineBundle(
             shared=shared,
             profiles=profiles,
             worker=worker,
-            version=str(manifest.get("version") or "unversioned"),
+            version=version.strip(),
         )
 
 
@@ -555,7 +576,7 @@ class VeyraClient:
         self,
         server: AppServer,
         catalogue: ModelCatalogue,
-        doctrine: DoctrineBundle | str,
+        doctrine: DoctrineBundle,
         cwd: Path,
         model: Model,
         effort: str,
@@ -563,17 +584,19 @@ class VeyraClient:
         approvals_reviewer: str = DEFAULT_APPROVALS_REVIEWER,
         debug: bool = False,
     ):
+        if not isinstance(doctrine, DoctrineBundle):
+            raise VeyraError(
+                "VeyraClient requires a complete, versioned DoctrineBundle"
+            )
         self.server = server
         self.catalogue = catalogue
-        self.doctrine = (
-            doctrine
-            if isinstance(doctrine, DoctrineBundle)
-            else DoctrineBundle.legacy(doctrine)
-        )
+        self.doctrine = doctrine
         self.cwd = cwd.resolve()
         self._require_veyra_host(model)
         self.model = model
         self.effort = catalogue.validate_effort(model, effort)
+        self.active_profile_version: str | None = doctrine.version
+        self.active_route_reason = "initial route"
         self.pending_route: PendingRoute | None = None
         self.palette = palette
         self.approvals_reviewer = approvals_reviewer
@@ -602,7 +625,16 @@ class VeyraClient:
     def developer_instructions(self) -> str:
         return self.instructions_for(self.model)
 
-    def instructions_for(self, model: Model) -> str:
+    def instructions_for(
+        self, model: Model, profile_version: str | None = None
+    ) -> str:
+        version = (
+            self.doctrine.version if profile_version is None else profile_version
+        )
+        if version != self.doctrine.version:
+            raise VeyraError(
+                "cognitive profile version changed before the route was applied"
+            )
         local_guidance = ""
         if self.catalogue.local_models:
             local_guidance = (
@@ -613,6 +645,9 @@ class VeyraClient:
             )
         return (
             self.doctrine.instructions_for(model.model_id)
+            + "\n\n# Cognitive profile attestation\n\n"
+            + f"Host profile: {model.model_id}\n"
+            + f"Profile version: {version}\n"
             + "\n\n# Harness routing\n\n"
             + "You are running inside Veyra Client. Use the client tool "
             + f"`{ROUTE_TOOL}` only when a later turn genuinely warrants a different "
@@ -739,9 +774,7 @@ class VeyraClient:
         return tools
 
     def start_thread(self, ephemeral: bool = False) -> None:
-        route = self.pending_route or PendingRoute(
-            self.model, self.effort, "active route"
-        )
+        route = self._next_route()
         self._require_veyra_host(route.model)
         result = self.server.request(
             "thread/start",
@@ -752,7 +785,9 @@ class VeyraClient:
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
-                "developerInstructions": self.instructions_for(route.model),
+                "developerInstructions": self.instructions_for(
+                    route.model, route.profile_version
+                ),
                 "dynamicTools": self.dynamic_tools(),
                 "serviceName": "veyra_client",
                 "allowProviderModelFallback": False,
@@ -785,7 +820,9 @@ class VeyraClient:
                 "approvalPolicy": APPROVAL_POLICY,
                 "approvalsReviewer": self.approvals_reviewer,
                 "sandbox": SANDBOX_MODE,
-                "developerInstructions": self.instructions_for(target),
+                "developerInstructions": self.instructions_for(
+                    target, self.doctrine.version
+                ),
                 "ephemeral": ephemeral,
             },
         )
@@ -793,6 +830,8 @@ class VeyraClient:
         self.thread_provider = target.provider
         self.model = target
         self.effort = target_effort
+        self.active_profile_version = self.doctrine.version
+        self.active_route_reason = "explicit thread fork"
         self.pending_route = None
         self.latest_usage = None
         print(self.palette.dim(f"forked -> {self.thread_id}"))
@@ -834,7 +873,13 @@ class VeyraClient:
         )
         if reported_effort:
             self.effort = self.catalogue.validate_effort(self.model, reported_effort)
-        self.pending_route = None
+        self.active_profile_version = None
+        self.active_route_reason = "resumed thread; profile requires reconciliation"
+        self._schedule_route(
+            self.model,
+            self.effort,
+            "reconcile resumed thread with the current cognitive profile",
+        )
         self.latest_usage = None
         print(self.palette.dim(f"resumed -> {self.thread_id}"))
 
@@ -862,9 +907,7 @@ class VeyraClient:
     def run_turn(self, text: str) -> None:
         if self.turn_active:
             raise VeyraError("wait for the active turn before starting another")
-        route = self.pending_route or PendingRoute(
-            self.model, self.effort, "active route"
-        )
+        route = self._next_route()
         self._require_veyra_host(route.model)
         if not self.thread_id:
             self.start_thread()
@@ -880,7 +923,9 @@ class VeyraClient:
                     "settings": {
                         "model": route.model.model_id,
                         "reasoning_effort": route.effort,
-                        "developer_instructions": self.instructions_for(route.model),
+                        "developer_instructions": self.instructions_for(
+                            route.model, route.profile_version
+                        ),
                     },
                 },
                 "cwd": str(self.cwd),
@@ -888,10 +933,15 @@ class VeyraClient:
                 "approvalsReviewer": self.approvals_reviewer,
             },
         )
+        try:
+            turn_id = result["turn"]["id"]
+        except (KeyError, TypeError) as exc:
+            raise VeyraError("turn/start returned no usable turn id") from exc
         self.model = route.model
         self.effort = route.effort
+        self.active_profile_version = route.profile_version
+        self.active_route_reason = route.reason
         self.pending_route = None
-        turn_id = result["turn"]["id"]
         self.turn_active = True
         wrote_agent_text = False
         try:
@@ -1085,7 +1135,30 @@ class VeyraClient:
     def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
         self._require_veyra_host(target)
         validated = self.catalogue.validate_effort(target, effort)
-        self.pending_route = PendingRoute(target, validated, reason)
+        self.pending_route = PendingRoute(
+            target, validated, reason, self.doctrine.version
+        )
+
+    def _next_route(self) -> PendingRoute:
+        if self.pending_route:
+            route = self.pending_route
+        else:
+            if self.active_profile_version != self.doctrine.version:
+                raise VeyraError(
+                    "active cognitive profile is unverified or stale; "
+                    "schedule a versioned route first"
+                )
+            route = PendingRoute(
+                self.model,
+                self.effort,
+                self.active_route_reason,
+                self.active_profile_version,
+            )
+        if route.profile_version != self.doctrine.version:
+            raise VeyraError(
+                "cognitive profile version changed before the route was applied"
+            )
+        return route
 
     def _handle_local_agent(
         self, request_id: Any, arguments: dict[str, Any]
@@ -1349,9 +1422,14 @@ class VeyraClient:
             print(f"thread: {self.thread_id}")
             print(f"cwd: {self.cwd}")
             print(f"route: {self.model.route_id}/{self.effort}")
+            print(f"profile: {self.active_profile_version or 'unverified'}")
+            print(f"route reason: {self.active_route_reason}")
             if self.pending_route:
                 pending = self.pending_route
-                print(f"pending: {pending.model.route_id}/{pending.effort} ({pending.reason})")
+                print(
+                    f"pending: {pending.model.route_id}/{pending.effort} "
+                    f"profile {pending.profile_version} ({pending.reason})"
+                )
         elif command == "/usage":
             self._show_usage()
         elif command == "/workers":
