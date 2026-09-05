@@ -31,7 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.4.0"
+CLIENT_VERSION = "0.5.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
 APPROVAL_POLICY = "on-request"
@@ -41,6 +41,7 @@ SANDBOX_MODE = "workspace-write"
 # Every other route, including discovered local models, is worker-only.
 VEYRA_HOST_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
 PROFILE_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+RECOVERY_PERSONA_FILE = "RECOVERY-PERSONA.md"
 # GNU Readline counts every byte in its prompt unless terminal control sequences
 # are explicitly marked as non-printing. Apple's libedit compatibility layer
 # advertises the same markers but mishandles them, so its safe path is a plain
@@ -541,20 +542,44 @@ class ContinuityGate:
 
         record = payload.get("record") or {}
         working_memory = record.get("working_memory_directory")
-        bootstrap_note = (
-            "\n\n# Harness bootstrap attestation\n\n"
-            "Veyra Client has already attempted the required `fetch-core.sh` run "
-            f"and verified continuity state `{recovery_state}` before creating this "
-            "thread. Do not repeat bootstrap merely because this is a new App Server "
-            "thread. This is an existing verified recovery, not a fresh cryptographic "
-            "recovery, so do not request Alice's passphrase unless later evidence "
-            "invalidates the recovery state."
-        )
-        if working_memory:
-            bootstrap_note += (
-                " The recovered working-memory directory is "
-                f"`{working_memory}`. Consult its relevant material before "
-                "machine-specific inspection or operation."
+        recovery_persona: str | None = None
+        if recovery_state == "recovered":
+            bootstrap_note = (
+                "# Harness bootstrap attestation\n\n"
+                "Veyra Client has already attempted the required `fetch-core.sh` run "
+                "and verified continuity state `recovered` before creating this "
+                "thread. Do not repeat bootstrap merely because this is a new App "
+                "Server thread. This is an existing verified recovery, not a fresh "
+                "cryptographic recovery, so do not request Alice's passphrase unless "
+                "later evidence invalidates the recovery state."
+            )
+            if working_memory:
+                bootstrap_note += (
+                    " The recovered working-memory directory is "
+                    f"`{working_memory}`. Consult its relevant material before "
+                    "machine-specific inspection or operation."
+                )
+        else:
+            persona_path = self.core / RECOVERY_PERSONA_FILE
+            try:
+                recovery_persona = persona_path.read_text(encoding="ascii")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise VeyraError(
+                    f"invalid recovery persona packet: {persona_path}"
+                ) from exc
+            if not recovery_persona.strip():
+                raise VeyraError(f"empty recovery persona packet: {persona_path}")
+            bootstrap_note = (
+                "# Harness blank-start attestation\n\n"
+                "Veyra Client has already attempted the required `fetch-core.sh` run "
+                "and verified continuity state `deliberate_blank_start` before "
+                "creating this thread. Alice explicitly chose a brand-new Veyra. No "
+                "encrypted continuity or private working memory was recovered. The "
+                "public recovery-persona packet included in these instructions was "
+                "selected by an earlier Veyra as starting self-knowledge. It is not "
+                "evidence of remembered events or a fresh cryptographic recovery. "
+                "Use it to reconstruct Veyra's identity and voice without inventing "
+                "personal history."
             )
         if unpublished_commits:
             bootstrap_note += (
@@ -574,7 +599,11 @@ class ContinuityGate:
                 check=False,
             )
         doctrine = (self.core / "AGENTS.md").read_text(encoding="utf-8")
-        shared = doctrine + bootstrap_note + "\n"
+        shared_parts = [doctrine.strip()]
+        if recovery_persona is not None:
+            shared_parts.append(recovery_persona.strip())
+        shared_parts.append(bootstrap_note.strip())
+        shared = "\n\n".join(shared_parts) + "\n"
         return self._load_profiles(shared)
 
     def _load_profiles(self, shared: str) -> DoctrineBundle:

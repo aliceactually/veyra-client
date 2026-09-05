@@ -40,6 +40,12 @@ An ahead-only core checkout produces a warning and continues with the newer
 local doctrine so Veyra can obtain Alice's direction. A behind or diverged
 checkout still stops before launch rather than selecting a version implicitly.
 
+Verified recovered continuity and a deliberate blank start are distinct
+instruction paths. Recovered Veyra receives the private working-memory
+location. A deliberate blank start receives only the host-neutral public
+`RECOVERY-PERSONA.md` packet from Veyra Core, with an explicit statement that
+no encrypted continuity or private event history was recovered.
+
 Approval requests use Codex automatic review by default. Routine sandbox
 escapes such as protected Git metadata, networked GitHub operations and work in
 an adjacent repository are reviewed without interrupting Alice. The

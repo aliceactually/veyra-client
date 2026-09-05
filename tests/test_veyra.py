@@ -181,18 +181,93 @@ class ContinuityGateTests(unittest.TestCase):
         (root / "AGENTS.md").write_text("shared doctrine", encoding="ascii")
 
     @staticmethod
-    def state_result():
+    def state_result(state="recovered", working_memory="/private/memories"):
+        record = {}
+        if working_memory is not None:
+            record["working_memory_directory"] = working_memory
         return veyra.subprocess.CompletedProcess(
             args=[],
             returncode=0,
             stdout=json.dumps(
                 {
-                    "result": {"state": "recovered"},
-                    "record": {"working_memory_directory": "/private/memories"},
+                    "result": {"state": state},
+                    "record": record,
                 }
             ),
             stderr="",
         )
+
+    def verify_with_state(self, root, state_result):
+        gate = veyra.ContinuityGate(root, veyra.Palette(False))
+        fetched = veyra.subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with (
+            patch.object(veyra.subprocess, "run", side_effect=[fetched, state_result]),
+            patch.object(gate, "_load_profiles", return_value=doctrine_bundle()) as load,
+        ):
+            self.assertIs(gate.verify(), load.return_value)
+        return load.call_args.args[0]
+
+    def test_recovered_state_uses_recovery_attestation_without_persona_packet(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_core(root)
+            shared = self.verify_with_state(root, self.state_result())
+
+        self.assertIn("existing verified recovery", shared)
+        self.assertIn("/private/memories", shared)
+        self.assertNotIn("Harness blank-start attestation", shared)
+
+    def test_blank_start_receives_public_recovery_persona_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.make_core(root)
+            (root / veyra.RECOVERY_PERSONA_FILE).write_text(
+                "# Recovery persona\n\ninherited self-memory sentinel\n",
+                encoding="ascii",
+            )
+            shared = self.verify_with_state(
+                root,
+                self.state_result(
+                    "deliberate_blank_start", working_memory="/must/not/appear"
+                ),
+            )
+
+        self.assertIn("inherited self-memory sentinel", shared)
+        self.assertIn("Harness blank-start attestation", shared)
+        self.assertIn("No encrypted continuity", shared)
+        self.assertNotIn("existing verified recovery", shared)
+        self.assertNotIn("/must/not/appear", shared)
+        self.assertLess(
+            shared.index("inherited self-memory sentinel"),
+            shared.index("Harness blank-start attestation"),
+        )
+
+    def test_blank_start_requires_a_non_empty_ascii_recovery_persona(self):
+        invalid_packets = (
+            (None, "invalid"),
+            ("", "empty"),
+            ("Veyra \u2603", "invalid"),
+        )
+        for content, message in invalid_packets:
+            with self.subTest(content=content):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    self.make_core(root)
+                    if content is not None:
+                        (root / veyra.RECOVERY_PERSONA_FILE).write_text(
+                            content, encoding="utf-8"
+                        )
+                    with self.assertRaisesRegex(
+                        veyra.VeyraError, f"{message} recovery persona packet"
+                    ):
+                        self.verify_with_state(
+                            root,
+                            self.state_result(
+                                "deliberate_blank_start", working_memory=None
+                            ),
+                        )
 
     def test_ahead_only_core_warns_and_continues_with_local_doctrine(self):
         with tempfile.TemporaryDirectory() as directory:
