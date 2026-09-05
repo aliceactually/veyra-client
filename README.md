@@ -24,7 +24,7 @@ cd <workspace>/veyra-client
 The default workspace is the directory containing the sibling `veyra-client`
 and `veyra-core` repositories. Override it with `--cwd PATH` when needed.
 
-By default, Veyra starts on `gpt-5.6-sol` with high reasoning. Veyra's
+By default, Veyra starts on `gpt-5.6-sol` with medium reasoning. Veyra's
 coordinating identity is hard-limited to the reviewed hosted routes
 `gpt-5.6-terra` and `gpt-5.6-sol`; every other route, including all local
 models, is worker-only. Sol handles coding, consequential judgement, durable
@@ -59,6 +59,7 @@ Run a non-generating connection check with:
 - `/models` - list models and supported efforts
 - `/model NAME` - route later turns to an approved Veyra host; aliases such as `terra` work
 - `/effort LEVEL` - set reasoning effort for later turns
+- `/attention [LEVEL]` - inspect or set attention for later turns
 - `/local MODEL PROMPT` - run a bounded local worker directly
 - `/worker MODEL PROMPT` - run a bounded task on any worker-only route
 - `/fork [MODEL] [EFFORT]` - branch the current history and enter the fork
@@ -68,6 +69,14 @@ Run a non-generating connection check with:
 - `/thread` - show the active thread and routing state
 - `/usage` - show the latest token counts
 - `/quit` - exit
+
+Veyra can call the client-provided `request_attention` tool to change reasoning
+effort without changing model. Attention starts at medium, rises to high or
+xhigh when the depth or consequence of the work warrants it, and settles back
+towards medium afterwards. Each shift is reasoned, visible in the terminal, and
+applies to the next turn; max effort is not selected automatically. `/attention`
+shows the active or pending level, while `/thread` shows the active route,
+attention, profile version and transition reason.
 
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then
@@ -95,6 +104,13 @@ the client exits. `I` is input,
 `C` is cached input, `O` is output, and `R` is reasoning output. The 16-character
 gauge shows their relative share of the latest turn; the final figure is the
 thread's cumulative token count.
+
+Interactive input uses Readline editing and history. Coloured prompt controls
+are excluded from GNU Readline's width calculations; the libedit compatibility
+layer used by macOS receives a plain prompt because it mishandles those control
+markers. Long input can therefore wrap across terminal rows while arrow
+movement, insertion and deletion continue to redraw at the correct cursor
+position.
 
 Worker threads receive their own stat bar, including elapsed time and output
 tokens per second. Use `/workers` to compare worker-only models for the current

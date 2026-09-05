@@ -31,9 +31,9 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.3.1"
+CLIENT_VERSION = "0.4.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
-DEFAULT_EFFORT = "high"
+DEFAULT_EFFORT = "medium"
 APPROVAL_POLICY = "on-request"
 DEFAULT_APPROVALS_REVIEWER = "auto_review"
 SANDBOX_MODE = "workspace-write"
@@ -41,7 +41,16 @@ SANDBOX_MODE = "workspace-write"
 # Every other route, including discovered local models, is worker-only.
 VEYRA_HOST_MODELS = frozenset({"gpt-5.6-terra", "gpt-5.6-sol"})
 PROFILE_VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# GNU Readline counts every byte in its prompt unless terminal control sequences
+# are explicitly marked as non-printing. Apple's libedit compatibility layer
+# advertises the same markers but mishandles them, so its safe path is a plain
+# prompt. Once the prompt width is wrong, wrapped cursor movement and redisplay
+# overwrite neighbouring rows.
+ANSI_CSI_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+READLINE_PROMPT_START_IGNORE = "\x01"
+READLINE_PROMPT_END_IGNORE = "\x02"
 ROUTE_TOOL = "request_model_route"
+ATTENTION_TOOL = "request_attention"
 LOCAL_AGENT_TOOL = "run_local_agent"
 WORKER_AGENT_TOOL = "run_worker_agent"
 LOCAL_ENDPOINTS = {
@@ -52,6 +61,22 @@ LOCAL_ENDPOINTS = {
 
 class VeyraError(RuntimeError):
     """A user-facing client error."""
+
+
+def readline_safe_prompt(prompt: str) -> str:
+    """Give the active Readline implementation an accurate prompt width."""
+    if readline is None:
+        return prompt
+    if "libedit" in (getattr(readline, "__doc__", "") or "").lower():
+        return ANSI_CSI_PATTERN.sub("", prompt)
+    return ANSI_CSI_PATTERN.sub(
+        lambda match: (
+            READLINE_PROMPT_START_IGNORE
+            + match.group(0)
+            + READLINE_PROMPT_END_IGNORE
+        ),
+        prompt,
+    )
 
 
 def format_tokens(value: Any) -> str:
@@ -678,9 +703,20 @@ class VeyraClient:
             + f"Host profile: {model.model_id}\n"
             + f"Profile version: {version}\n"
             + "\n\n# Harness routing\n\n"
-            + "You are running inside Veyra Client. Use the client tool "
+            + "You are running inside Veyra Client. Normal attention is Sol at "
+            + "medium effort. Use the client tool "
+            + f"`{ATTENTION_TOOL}` when a later turn warrants a different reasoning "
+            + "effort without changing model. Use low for simple, readily repaired "
+            + "conversation; medium for ordinary focused work; high for coding, "
+            + "consequential judgement, durable memory and deep interpretation; and "
+            + "xhigh only for unusually difficult or consequential work. Do not select "
+            + "max automatically. Avoid oscillating between levels, give a concise "
+            + "reason for every shift, and return towards medium after the deeper work "
+            + "is resolved. If a request unexpectedly exceeds the active attention, "
+            + "schedule the required level and defer consequential execution until the "
+            + "next turn when practical. Use "
             + f"`{ROUTE_TOOL}` only when a later turn genuinely warrants a different "
-            + "model or reasoning effort. Veyra herself may only run on the approved "
+            + "model. Veyra herself may only run on the approved "
             + "hosted identity routes gpt-5.6-terra and gpt-5.6-sol; local and all "
             + "other routes are worker-only. Sol high is required for coding, "
             + "consequential judgement, durable memory and deep human-interface "
@@ -690,7 +726,7 @@ class VeyraClient:
             + "An explicit request to commit or checkpoint "
             + "code together with continuity or memories is consequential by default: "
             + "use Sol high or above for the committing turn. Give a concise reason. "
-            + "A requested route "
+            + "A requested route or attention shift "
             + "takes effect atomically on the next turn. Never treat model routing "
             + "as permission "
             + "to bypass sandbox or approval boundaries."
@@ -729,7 +765,32 @@ class VeyraClient:
                     "required": ["model", "effort", "reason"],
                     "additionalProperties": False,
                 },
-            }
+            },
+            {
+                "type": "function",
+                "name": ATTENTION_TOOL,
+                "description": (
+                    "Request a reasoning-effort change for subsequent turns without "
+                    "changing Veyra's selected model. Normal attention is medium; use "
+                    "high or xhigh when depth or consequence genuinely warrants it, "
+                    "and settle back towards medium afterwards."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "effort": {
+                            "type": "string",
+                            "description": "A reasoning effort supported by the model.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Concise reason for changing attention.",
+                        },
+                    },
+                    "required": ["effort", "reason"],
+                    "additionalProperties": False,
+                },
+            },
         ]
         worker_routes = ", ".join(
             model.route_id
@@ -1135,6 +1196,8 @@ class VeyraClient:
         tool = params.get("tool")
         if tool == ROUTE_TOOL:
             self._handle_model_route(request_id, arguments)
+        elif tool == ATTENTION_TOOL:
+            self._handle_attention(request_id, arguments)
         elif tool == WORKER_AGENT_TOOL:
             self._handle_worker_agent(request_id, arguments)
         elif tool == LOCAL_AGENT_TOOL:
@@ -1151,6 +1214,8 @@ class VeyraClient:
             effort = self.catalogue.validate_effort(
                 target, str(arguments.get("effort", ""))
             )
+            if effort == "max":
+                raise VeyraError("max effort requires manual selection")
             reason = str(arguments.get("reason", "")).strip()
             if not reason:
                 raise VeyraError("a routing reason is required")
@@ -1160,6 +1225,29 @@ class VeyraClient:
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
             self._tool_response(request_id, False, f"Route rejected: {exc}")
+
+    def _handle_attention(
+        self, request_id: Any, arguments: dict[str, Any]
+    ) -> None:
+        try:
+            target = self.pending_route.model if self.pending_route else self.model
+            effort = self.catalogue.validate_effort(
+                target, str(arguments.get("effort", ""))
+            )
+            if effort == "max":
+                raise VeyraError("max effort requires manual selection")
+            reason = str(arguments.get("reason", "")).strip()
+            if not reason:
+                raise VeyraError("an attention reason is required")
+            self._schedule_route(target, effort, reason)
+            text = (
+                f"Scheduled {target.route_id}/{effort} attention for the next turn: "
+                f"{reason}"
+            )
+            print(self.palette.dim(f"\n[attention] {text}"))
+            self._tool_response(request_id, True, text)
+        except VeyraError as exc:
+            self._tool_response(request_id, False, f"Attention shift rejected: {exc}")
 
     def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
         self._require_veyra_host(target)
@@ -1350,8 +1438,8 @@ class VeyraClient:
 
     @staticmethod
     def _read_line(prompt: str) -> str:
-        """Read an editable line and retain it for Up/Down command history."""
-        text = input(prompt)
+        """Read editable input with correct wrapped-row cursor accounting."""
+        text = input(readline_safe_prompt(prompt))
         if readline is not None and text:
             readline.add_history(text)
         return text
@@ -1367,6 +1455,7 @@ class VeyraClient:
                 "/models               available routes\n"
                 "/model NAME            set model for later turns\n"
                 "/effort LEVEL          set reasoning effort\n"
+                "/attention [LEVEL]     inspect or set attention\n"
                 "/local MODEL PROMPT    run a bounded local worker\n"
                 "/worker MODEL PROMPT   run a bounded worker-only model\n"
                 "/fork [MODEL] [EFFORT] branch history and enter the fork\n"
@@ -1408,6 +1497,19 @@ class VeyraClient:
                 effort = self.catalogue.validate_effort(target, args[0])
                 self._schedule_route(target, effort, "manual effort selection")
                 print(self.palette.dim(f"next turn -> {target.route_id}/{effort}"))
+        elif command == "/attention":
+            if not args:
+                effort = self.pending_route.effort if self.pending_route else self.effort
+                print(effort)
+            else:
+                target = self.pending_route.model if self.pending_route else self.model
+                effort = self.catalogue.validate_effort(target, args[0])
+                self._schedule_route(target, effort, "manual attention selection")
+                print(
+                    self.palette.dim(
+                        f"next attention -> {target.route_id}/{effort}"
+                    )
+                )
         elif command == "/local":
             if len(args) < 2:
                 raise VeyraError("usage: /local MODEL PROMPT")
@@ -1451,6 +1553,7 @@ class VeyraClient:
             print(f"thread: {self.thread_id}")
             print(f"cwd: {self.cwd}")
             print(f"route: {self.model.route_id}/{self.effort}")
+            print(f"attention: {self.effort}")
             print(f"profile: {self.active_profile_version or 'unverified'}")
             print(f"route reason: {self.active_route_reason}")
             if self.pending_route:

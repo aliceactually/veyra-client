@@ -283,6 +283,42 @@ class MainTests(unittest.TestCase):
             self.assertEqual(veyra.VeyraClient._read_line("alice> "), "Reloaded")
         add_history.assert_called_once_with("Reloaded")
 
+    @unittest.skipIf(veyra.readline is None, "readline is unavailable")
+    def test_read_line_uses_plain_prompt_with_libedit_wrapped_editing(self):
+        coloured_prompt = "\033[36malice> \033[0m"
+        with (
+            patch("builtins.input", return_value="a long wrapped message") as read,
+            patch.object(veyra.readline, "add_history"),
+            patch.object(veyra.readline, "__doc__", "libedit readline wrapper"),
+        ):
+            self.assertEqual(
+                veyra.VeyraClient._read_line(coloured_prompt),
+                "a long wrapped message",
+            )
+        read.assert_called_once_with("alice> ")
+
+    @unittest.skipIf(veyra.readline is None, "readline is unavailable")
+    def test_read_line_marks_gnu_readline_colours_as_zero_width(self):
+        coloured_prompt = "\033[36malice> \033[0m"
+        with (
+            patch("builtins.input", return_value="wrapped") as read,
+            patch.object(veyra.readline, "add_history"),
+            patch.object(veyra.readline, "__doc__", "GNU readline wrapper"),
+        ):
+            self.assertEqual(veyra.VeyraClient._read_line(coloured_prompt), "wrapped")
+        read.assert_called_once_with(
+            "\001\033[36m\002alice> \001\033[0m\002"
+        )
+
+    def test_read_line_leaves_prompt_untouched_without_readline(self):
+        coloured_prompt = "\033[36malice> \033[0m"
+        with (
+            patch.object(veyra, "readline", None),
+            patch("builtins.input", return_value="fallback") as read,
+        ):
+            self.assertEqual(veyra.VeyraClient._read_line(coloured_prompt), "fallback")
+        read.assert_called_once_with(coloured_prompt)
+
 
 class TokenStatTests(unittest.TestCase):
     def test_formats_tokens_compactly(self):
@@ -504,7 +540,7 @@ class ForkTests(unittest.TestCase):
     def test_default_route_and_terra_ambient_boundary(self):
         args = veyra.parse_args([])
         self.assertEqual(args.model, "gpt-5.6-sol")
-        self.assertEqual(args.effort, "high")
+        self.assertEqual(args.effort, "medium")
 
         catalogue = self.catalogue_with_luna()
         client = veyra.VeyraClient(
@@ -516,9 +552,101 @@ class ForkTests(unittest.TestCase):
             "medium",
             veyra.Palette(False),
         )
-        self.assertIn("Sol high is required", client.developer_instructions)
+        self.assertIn("Normal attention is Sol at medium", client.developer_instructions)
+        self.assertIn("request_attention", client.developer_instructions)
+        self.assertIn("Do not select max automatically", client.developer_instructions)
+        self.assertIn("high for coding", client.developer_instructions)
         self.assertIn("ambient, low-stakes conversation", client.developer_instructions)
         self.assertIn("Terra must request Sol", client.developer_instructions)
+
+    def test_attention_tool_is_exposed_separately_from_model_routing(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "high", veyra.Palette(False)
+        )
+        tools = {tool["name"]: tool for tool in client.dynamic_tools()}
+        self.assertIn(veyra.ATTENTION_TOOL, tools)
+        schema = tools[veyra.ATTENTION_TOOL]["inputSchema"]
+        self.assertEqual(schema["required"], ["effort", "reason"])
+        self.assertNotIn("model", schema["properties"])
+
+    def test_attention_shift_changes_only_effort_on_the_next_turn(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "low"},
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                    {"reasoningEffort": "xhigh"},
+                    {"reasoningEffort": "max"},
+                ],
+            }]
+        )
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        with redirect_stdout(io.StringIO()):
+            client._handle_dynamic_tool(
+                12,
+                {
+                    "tool": veyra.ATTENTION_TOOL,
+                    "arguments": {
+                        "effort": "high",
+                        "reason": "implementation requires deeper attention",
+                    },
+                },
+            )
+        self.assertEqual(client.model.model_id, "gpt-5.6-sol")
+        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
+        self.assertEqual(client.pending_route.effort, "high")
+        self.assertEqual(
+            client.pending_route.reason,
+            "implementation requires deeper attention",
+        )
+        self.assertTrue(server.calls[-1][1]["result"]["success"])
+
+    def test_attention_shift_rejects_unsupported_effort(self):
+        catalogue = self.catalogue_with_sol()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "high", veyra.Palette(False)
+        )
+        client._handle_attention(
+            13, {"effort": "low", "reason": "routine conversation"}
+        )
+        self.assertIsNone(client.pending_route)
+        self.assertFalse(server.calls[-1][1]["result"]["success"])
+
+    def test_attention_tool_cannot_select_max_automatically(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "max"},
+                ],
+            }]
+        )
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        client._handle_attention(
+            14, {"effort": "max", "reason": "automatic escalation"}
+        )
+        self.assertIsNone(client.pending_route)
+        response = server.calls[-1][1]["result"]
+        self.assertFalse(response["success"])
+        self.assertIn("manual selection", response["contentItems"][0]["text"])
 
     def test_fork_routes_to_selected_model(self):
         catalogue = veyra.ModelCatalogue(
@@ -646,6 +774,7 @@ class ForkTests(unittest.TestCase):
             client._command("/thread")
         rendered = output.getvalue()
         self.assertIn("profile: test.2", rendered)
+        self.assertIn("attention: medium", rendered)
         self.assertIn("route reason: initial route", rendered)
         self.assertIn("pending: gpt-5.6-sol/high profile test.2 (startled)", rendered)
 
