@@ -67,6 +67,18 @@ Run a non-generating connection check with:
 ./veyra.py --smoke
 ```
 
+Run the six-case routing screen with:
+
+```sh
+python3 scripts/run_routing_eval.py --output /tmp/veyra-routing-eval
+```
+
+The runner makes one ephemeral, read-only call to Terra-high and one to
+Sol-medium through the existing Codex CLI login. It writes a shuffled A/B review
+file and a separate identity key to the chosen output directory. Score
+`blinded.json` before opening `key.json`; generated responses are deliberately
+not retained in the repository.
+
 ## Commands
 
 - `/help` - show commands
@@ -102,6 +114,12 @@ without waiting for placeholder input from Alice. The continuation is delivered
 as client tool output, never as a fabricated user message, and cannot recursively
 create further turns. `/attention` shows the active or pending level, while
 `/thread` shows the active route, attention, profile version and transition reason.
+
+Attention changes depth within the active host; it does not change that host's
+role or judgement boundary. In particular, Terra at high or max is still for
+low-stakes, readily repaired work. Coding, consequential judgement, security,
+durable memory and deep interpretation require a route change to Sol at high or
+above. Raising Terra's attention is not a substitute for that escalation.
 
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then
