@@ -546,7 +546,7 @@ class TokenStatTests(unittest.TestCase):
         self.assertEqual(stats.output_tokens, 40)
         self.assertEqual(stats.reasoning_tokens, 20)
 
-    def test_status_bar_reserves_and_updates_the_bottom_row(self):
+    def test_status_bar_uses_primary_screen_scrollback_and_updates_bottom_row(self):
         client = veyra.VeyraClient(
             FakeServer(), self.catalogue(), doctrine_bundle(), Path.cwd(),
             self.catalogue().resolve("terra"), "medium", veyra.Palette(True)
@@ -562,10 +562,11 @@ class TokenStatTests(unittest.TestCase):
             client._render_status_bar("[ Veyra | telemetry ]")
         self.assertEqual(
             output.getvalue(),
-            "\033[?1049h\033[2J\033[H\033[1;23r"
+            "\033[2J\033[H\033[1;23r"
             "\0337\033[24;1H\033[2K"
             "\033[2m[ Veyra | telemetry ]\033[0m\0338",
         )
+        self.assertNotIn("\033[?1049h", output.getvalue())
         self.assertTrue(client.status_bar_visible)
 
     def test_stopping_terminal_ui_restores_the_terminal(self):
@@ -584,8 +585,9 @@ class TokenStatTests(unittest.TestCase):
             client._render_status_bar("[ Veyra | telemetry ]")
             client._stop_terminal_ui()
         self.assertTrue(output.getvalue().endswith(
-            "\0337\033[24;1H\033[2K\0338\033[r\033[?1049l"
+            "\0337\033[24;1H\033[2K\0338\033[r\033[24;1H\r\n"
         ))
+        self.assertNotIn("\033[?1049l", output.getvalue())
         self.assertFalse(client.status_bar_visible)
         self.assertFalse(client.terminal_ui_active)
 
@@ -867,7 +869,10 @@ class ForkTests(unittest.TestCase):
             tools[veyra.ATTENTION_TOOL]["description"],
         )
         schema = tools[veyra.ATTENTION_TOOL]["inputSchema"]
-        self.assertEqual(schema["required"], ["effort", "reason"])
+        self.assertEqual(
+            schema["required"], ["effort", "reason", "continue_task"]
+        )
+        self.assertEqual(schema["properties"]["continue_task"]["type"], "boolean")
         self.assertNotIn("model", schema["properties"])
 
     def test_attention_shift_changes_only_effort_on_the_next_turn(self):
@@ -897,6 +902,7 @@ class ForkTests(unittest.TestCase):
                     "arguments": {
                         "effort": "high",
                         "reason": "implementation requires deeper attention",
+                        "continue_task": True,
                     },
                 },
             )
@@ -908,6 +914,7 @@ class ForkTests(unittest.TestCase):
             client.pending_route.reason,
             "implementation requires deeper attention",
         )
+        self.assertTrue(client._route_continuation_requested)
         self.assertTrue(server.calls[-1][1]["result"]["success"])
 
     def test_attention_shift_rejects_unsupported_effort(self):
@@ -922,6 +929,93 @@ class ForkTests(unittest.TestCase):
         )
         self.assertIsNone(client.pending_route)
         self.assertFalse(server.calls[-1][1]["result"]["success"])
+
+    def test_requested_attention_continues_without_placeholder_user_input(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                ],
+            }]
+        )
+        server = RouteContinuationServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        with redirect_stdout(io.StringIO()):
+            client.run_turn("Implement the requested change")
+
+        turns = [params for method, params in server.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["input"][0]["text"], "Implement the requested change")
+        self.assertEqual(turns[1]["input"], [])
+        self.assertEqual(
+            turns[1]["toolOutput"]["name"], veyra.ROUTE_CONTINUATION_TOOL
+        )
+        self.assertEqual(turns[1]["turnTrigger"], "route_change_continuation")
+        self.assertEqual(
+            turns[1]["collaborationMode"]["settings"]["reasoning_effort"],
+            "high",
+        )
+        self.assertIsNone(client.pending_route)
+
+    def test_attention_change_can_wait_for_the_next_real_user_turn(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                ],
+            }]
+        )
+        server = RouteContinuationServer(continue_task=False)
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        with redirect_stdout(io.StringIO()):
+            client.run_turn("Finish at the present attention")
+
+        turns = [params for method, params in server.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 1)
+        self.assertFalse(client._route_continuation_requested)
+        self.assertEqual(client.pending_route.effort, "high")
+
+    def test_automatic_route_continuation_is_limited_to_one_follow_up(self):
+        catalogue = veyra.ModelCatalogue(
+            [{
+                "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                "displayName": "Sol", "defaultReasoningEffort": "medium",
+                "supportedReasoningEfforts": [
+                    {"reasoningEffort": "medium"},
+                    {"reasoningEffort": "high"},
+                ],
+            }]
+        )
+        server = RouteContinuationServer(request_on_every_turn=True)
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        with redirect_stdout(io.StringIO()):
+            client.run_turn("Continue once")
+
+        turns = [params for method, params in server.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        self.assertFalse(client._route_continuation_requested)
+        self.assertIsNotNone(client.pending_route)
 
     def test_attention_tool_can_select_max_after_explicit_permission(self):
         catalogue = veyra.ModelCatalogue(
@@ -945,6 +1039,7 @@ class ForkTests(unittest.TestCase):
                 {
                     "effort": "max",
                     "reason": "Alice explicitly approved max for this review",
+                    "continue_task": False,
                 },
             )
         self.assertEqual(client.pending_route.effort, "max")
@@ -1027,6 +1122,58 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(client.thread_id, "forked-thread")
         self.assertEqual(client.effort, "high")
 
+    def test_branch_command_enters_history_and_fork_command_does_not(self):
+        catalogue = self.catalogue_with_sol()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "source-thread"
+        with redirect_stdout(io.StringIO()):
+            client._command("/branch sol high")
+        self.assertEqual(server.calls[-1][0], "thread/fork")
+        self.assertEqual(client.thread_id, "forked-thread")
+        with self.assertRaisesRegex(veyra.VeyraError, "use /branch"):
+            client._command("/fork sol high")
+
+    def test_repl_blocks_the_prompt_while_a_foreground_turn_runs(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        reads = []
+
+        def read_line(prompt):
+            reads.append(prompt)
+            return "Please investigate" if len(reads) == 1 else "/quit"
+
+        def run_turn(text):
+            self.assertEqual(text, "Please investigate")
+            self.assertEqual(reads, [client.user_prompt])
+
+        with patch.object(client, "_read_line", side_effect=read_line), patch.object(
+            client, "run_turn", side_effect=run_turn
+        ), redirect_stdout(io.StringIO()):
+            client.repl()
+        self.assertEqual(reads, [client.user_prompt, client.user_prompt])
+
+    def test_collaboration_guidance_keeps_async_reports_out_of_foreground(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        self.assertIn(
+            "after a successful asynchronous launch, return control to Alice",
+            client.developer_instructions,
+        )
+        self.assertIn(
+            "do not silently absorb an entire long delegated task",
+            client.developer_instructions,
+        )
+
     def test_model_can_schedule_a_later_route(self):
         catalogue = veyra.ModelCatalogue(
             [
@@ -1065,6 +1212,7 @@ class ForkTests(unittest.TestCase):
                         "model": "sol",
                         "effort": "high",
                         "reason": "consequential review",
+                        "continue_task": True,
                     },
                 },
             )
@@ -1073,6 +1221,7 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-sol")
         self.assertEqual(client.pending_route.effort, "high")
         self.assertEqual(client.pending_route.profile_version, "test")
+        self.assertTrue(client._route_continuation_requested)
         self.assertTrue(server.calls[-1][1]["result"]["success"])
 
     def test_manual_model_and_effort_changes_remain_pending(self):
@@ -1136,7 +1285,8 @@ class ForkTests(unittest.TestCase):
         client.thread_id = "thread"
         client.thread_provider = "openai"
         client._schedule_route(catalogue.resolve("sol"), "high", "startled")
-        with redirect_stdout(io.StringIO()):
+        output = io.StringIO()
+        with redirect_stdout(output):
             client.run_turn("Do the consequential work")
         self.assertEqual(client.model.model_id, "gpt-5.6-sol")
         self.assertEqual(client.effort, "high")
@@ -1154,6 +1304,11 @@ class ForkTests(unittest.TestCase):
             "Host profile: gpt-5.6-sol", settings["developer_instructions"]
         )
         self.assertIn("Profile version: test", settings["developer_instructions"])
+        self.assertIn(
+            "[ Veyra sol/high | turn started | model terra -> sol "
+            "| attention medium -> high ]",
+            output.getvalue(),
+        )
 
     def test_resume_reconciles_the_reported_route_with_the_current_profile(self):
         catalogue = self.catalogue_with_sol()
@@ -1575,6 +1730,49 @@ class TurnServer(FakeServer):
             )
             return {"turn": {"id": "turn"}}
         return {"thread": {"id": "thread"}}
+
+
+class RouteContinuationServer(FakeServer):
+    def __init__(self, request_on_every_turn=False, continue_task=True):
+        super().__init__()
+        self.events = queue.Queue()
+        self.turn_count = 0
+        self.request_on_every_turn = request_on_every_turn
+        self.continue_task = continue_task
+
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method != "turn/start":
+            return {"thread": {"id": "thread"}}
+        self.turn_count += 1
+        turn_id = f"turn-{self.turn_count}"
+        if self.turn_count == 1 or self.request_on_every_turn:
+            self.events.put(
+                {
+                    "id": 100 + self.turn_count,
+                    "method": "item/tool/call",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turnId": turn_id,
+                        "tool": veyra.ATTENTION_TOOL,
+                        "arguments": {
+                            "effort": "high",
+                            "reason": "unfinished implementation needs high attention",
+                            "continue_task": self.continue_task,
+                        },
+                    },
+                }
+            )
+        self.events.put(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": params["threadId"],
+                    "turn": {"id": turn_id, "status": "completed"},
+                },
+            }
+        )
+        return {"turn": {"id": turn_id}}
 
 
 class ResumeTurnServer(TurnServer):

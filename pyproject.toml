@@ -1,8 +1,9 @@
 [project]
 name = "veyra-client"
-version = "0.7.0"
+version = "0.9.0"
 description = "A minimal terminal client for Codex App Server"
 requires-python = ">=3.11"
+license = "Apache-2.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

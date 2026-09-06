@@ -12,7 +12,7 @@ store API keys.
 
 - Python 3.11 or newer
 - A current `codex` CLI, already signed in
-- A local checkout of `aliceactually/veyra-core`
+- A local checkout of `veyra-core/veyra-core`
 - Optional: Ollama on `127.0.0.1:11434` or LM Studio on `127.0.0.1:1234`
 
 ## Run
@@ -80,7 +80,7 @@ Run a non-generating connection check with:
 - `/jobs` - list background worker jobs
 - `/job ID` - inspect one background worker and its report
 - `/cancel-job ID` - interrupt a background worker
-- `/fork [MODEL] [EFFORT]` - branch the current history and enter the fork
+- `/branch [MODEL] [EFFORT]` - branch the current history and enter that branch
 - `/new` - start an empty thread
 - `/threads` - list recent threads
 - `/resume THREAD_ID` - resume an existing thread
@@ -96,9 +96,12 @@ ask Alice before selecting it for that use. Max is a behavioural consent
 boundary rather than a client prohibition; once Alice agrees, Veyra can request
 it directly. The client hard-rejects ultra and any unclassified effort, keeping
 max as the mechanical ceiling. Each shift is reasoned, visible in the terminal,
-and applies to the next turn. `/attention` shows the active or pending level, while
-`/thread` shows the active route, attention, profile version and transition
-reason.
+and applies to the next turn. When unfinished work requires that new attention,
+Veyra sets `continue_task` and the client initiates one bounded follow-up turn
+without waiting for placeholder input from Alice. The continuation is delivered
+as client tool output, never as a fabricated user message, and cannot recursively
+create further turns. `/attention` shows the active or pending level, while
+`/thread` shows the active route, attention, profile version and transition reason.
 
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then
@@ -108,6 +111,9 @@ non-empty profile version, exposed by `/thread`, and included in the developer
 instruction attestation. If that turn cannot start, the old route remains
 active and the transition stays pending. Resumed threads reconcile their
 reported model and effort with the current profile on the next turn.
+Model-route requests use the same explicit, single-hop `continue_task` mechanism
+when current work must resume immediately. Manual `/model`, `/effort` and
+`/attention` selections remain pending for Alice's next substantive turn.
 Cross-provider routes automatically fork the current history. The
 `run_local_agent` tool lets
 the coordinating model run a bounded task on a discovered local model and
@@ -134,9 +140,13 @@ profiles live in `veyra-core/profiles`; worker threads receive an identity-free
 worker profile. Private memories and dialogue corpora remain in Alice-encrypted
 continuity, never in either public repository.
 
-In an interactive terminal, Veyra reserves the bottom row for a compact token
-status bar. The conversation scrolls above it, and the terminal is restored when
-the client exits. `I` is input,
+In an interactive terminal, Veyra reserves the bottom row for a compact status
+bar while remaining on the terminal's primary screen. Conversation output is
+therefore retained in the terminal's normal scrollback buffer, and the terminal
+is restored when the client exits. When an accepted turn begins, the bar changes
+immediately to show the active model and attention level, explicitly labelling
+any model or attention switch. Final token telemetry replaces that transient
+turn-start state. `I` is input,
 `C` is cached input, `O` is output, and `R` is reasoning output. The 16-character
 gauge shows their relative share of the latest turn; the final figure is the
 thread's cumulative token count.
@@ -164,6 +174,15 @@ benchmark database.
 App Server notifications are routed per thread, so a background worker cannot
 consume or discard Veyra's turn events (or those of another worker).
 
+Foreground Veyra turns own the terminal until they complete, so the `alice>`
+prompt is never displayed while Veyra is still thinking or working. The status
+row shows the active turn and any route or attention transition. Explicit
+alternate conversation histories use `/branch`; the former `/fork` spelling no
+longer changes the foreground thread. Asynchronous worker and collaboration
+reports return to Veyra for review and a natural summary rather than opening
+another terminal interface; once Veyra has acknowledged a detached hand-off,
+the ordinary prompt is available again.
+
 Local routes are written as `provider:model`, for example:
 
 ```text
@@ -172,3 +191,9 @@ ollama:veyra-intel-coder:qwen3-coder-32k
 
 The protocol implementation follows the official [Codex App Server
 documentation](https://developers.openai.com/codex/app-server).
+
+## Licence
+
+Veyra Client is licensed under the [Apache License 2.0](LICENSE). It is
+developed as a collaboration between Alice Kallista Saunier and Veyra; see
+[NOTICE](NOTICE) for formal attribution.

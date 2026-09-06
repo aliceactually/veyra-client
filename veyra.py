@@ -31,7 +31,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.7.0"
+CLIENT_VERSION = "0.9.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
 APPROVAL_POLICY = "on-request"
@@ -69,6 +69,7 @@ LOCAL_AGENT_TOOL = "run_local_agent"
 WORKER_AGENT_TOOL = "run_worker_agent"
 SPAWN_WORKER_AGENT_TOOL = "spawn_worker_agent"
 BACKGROUND_WORKER_RESULT_TOOL = "background_worker_result"
+ROUTE_CONTINUATION_TOOL = "route_change_continuation"
 MAX_BACKGROUND_WORKERS = 3
 PROMPT_COLOURS = {
     "blue": "34",
@@ -908,6 +909,7 @@ class VeyraClient:
         self.active_profile_version: str | None = doctrine.version
         self.active_route_reason = "initial route"
         self.pending_route: PendingRoute | None = None
+        self._route_continuation_requested = False
         self.palette = palette
         self.prompt_preferences_path = prompt_preferences_path
         self.user_prompt_name, self.user_prompt_colour = (
@@ -1070,8 +1072,12 @@ class VeyraClient:
             + "Avoid oscillating between levels, give a concise "
             + "reason for every shift, and return towards medium after the deeper work "
             + "is resolved. If a request unexpectedly exceeds the active attention, "
-            + "schedule the required level and defer consequential execution until the "
-            + "next turn when practical. Use "
+            + "schedule the required level with `continue_task` set to true and defer "
+            + "consequential execution until the automatically initiated next turn. "
+            + "Alice has authorised this single bounded continuation, so never ask her "
+            + "for placeholder input merely to activate a requested route. Set "
+            + "`continue_task` to false when the change is only for later work, such as "
+            + "settling attention after completing a task. Use "
             + f"`{ROUTE_TOOL}` only when a later turn genuinely warrants a different "
             + "model. Veyra herself may only run on the approved "
             + "hosted identity routes gpt-5.6-terra and gpt-5.6-sol; local and all "
@@ -1091,7 +1097,12 @@ class VeyraClient:
             + "name, or when they ask for a prompt colour. A stored user-local "
             + "preference is restored on launch; otherwise the initial prompt is "
             + "generic. Only Veyra may personalise it, and the display preference "
-            + "does not establish identity or continuity."
+            + "does not establish identity or continuity. Treat spawned collaboration "
+            + "agents as background delegates: after a successful asynchronous launch, "
+            + "return control to Alice rather than waiting merely to display their "
+            + "transcript. Review and summarise their reports when the client returns "
+            + "them. If a launch fails, report it compactly; do not silently absorb an "
+            + "entire long delegated task into the foreground turn."
             + worker_guidance
             + "\n"
         )
@@ -1124,8 +1135,16 @@ class VeyraClient:
                             "type": "string",
                             "description": "Concise reason for changing the route.",
                         },
+                        "continue_task": {
+                            "type": "boolean",
+                            "description": (
+                                "True only when unfinished work should continue "
+                                "immediately under the requested route. The client "
+                                "will initiate one bounded follow-up turn."
+                            ),
+                        },
                     },
-                    "required": ["model", "effort", "reason"],
+                    "required": ["model", "effort", "reason", "continue_task"],
                     "additionalProperties": False,
                 },
             },
@@ -1151,8 +1170,16 @@ class VeyraClient:
                             "type": "string",
                             "description": "Concise reason for changing attention.",
                         },
+                        "continue_task": {
+                            "type": "boolean",
+                            "description": (
+                                "True only when unfinished work should continue "
+                                "immediately at the new attention level. The client "
+                                "will initiate one bounded follow-up turn."
+                            ),
+                        },
                     },
-                    "required": ["effort", "reason"],
+                    "required": ["effort", "reason", "continue_task"],
                     "additionalProperties": False,
                 },
             },
@@ -1443,6 +1470,36 @@ class VeyraClient:
 
     def run_turn(self, text: str) -> None:
         self._run_turn([{"type": "text", "text": text}])
+        self._deliver_route_continuation()
+
+    def _deliver_route_continuation(self) -> bool:
+        """Apply one agent-requested route and resume unfinished work without Alice."""
+        if not self._route_continuation_requested:
+            return False
+        if not self.pending_route:
+            self._route_continuation_requested = False
+            return False
+        pending = self.pending_route
+        self._route_continuation_requested = False
+        payload = (
+            "Alice has authorised this client-initiated continuation. Apply the "
+            f"requested route {pending.model.route_id}/{pending.effort} and continue "
+            "the unfinished task from the preceding turn. Do not ask Alice for "
+            "placeholder input. This continuation is bounded to one follow-up turn; "
+            "finish the work if possible and do not create a continuation loop."
+        )
+        print(self.palette.dim("\n[continue] applying requested route"))
+        try:
+            self._run_turn(
+                [],
+                tool_output={"name": ROUTE_CONTINUATION_TOOL, "output": payload},
+                turn_trigger="route_change_continuation",
+            )
+        finally:
+            # A route request made inside the automatic turn remains pending for real
+            # user activity, but cannot recursively manufacture more turns.
+            self._route_continuation_requested = False
+        return True
 
     def _run_turn(
         self,
@@ -1453,6 +1510,8 @@ class VeyraClient:
     ) -> None:
         if self.turn_active:
             raise VeyraError("wait for the active turn before starting another")
+        previous_model = self.model
+        previous_effort = self.effort
         route = self._next_route()
         self._require_veyra_host(route.model)
         if not self.thread_id:
@@ -1495,6 +1554,7 @@ class VeyraClient:
         self.turn_active = True
         wrote_agent_text = False
         try:
+            self._show_turn_start_status(previous_model, previous_effort)
             while True:
                 message = events.get()
                 method = message.get("method")
@@ -1506,12 +1566,22 @@ class VeyraClient:
                     continue
                 if method == "item/agentMessage/delta":
                     if params.get("turnId") == turn_id:
+                        delta = params.get("delta", "")
                         if not wrote_agent_text:
                             print(self.palette.accent("veyra> "), end="", flush=True)
                             wrote_agent_text = True
-                        print(params.get("delta", ""), end="", flush=True)
+                        print(delta, end="", flush=True)
                 elif method == "item/started":
                     self._show_item_started(params.get("item") or {})
+                elif method == "item/completed":
+                    item = params.get("item") or {}
+                    if item.get("type") == "collabToolCall":
+                        status = item.get("status") or "completed"
+                        self._render_status_bar(
+                            f"[ Veyra | background agent {status}"
+                            + self._background_status_suffix()
+                            + " ]"
+                        )
                 elif method == "thread/tokenUsage/updated":
                     self.latest_usage = params.get("tokenUsage")
                 elif method == "error":
@@ -1589,7 +1659,7 @@ class VeyraClient:
     def _approval_choice(self) -> str:
         while True:
             try:
-                answer = self._read_line(
+                answer = self._read_interactive_response(
                     "[y] once  [a] session  [n] decline  [c] cancel > "
                 ).strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -1616,10 +1686,9 @@ class VeyraClient:
                 print(f"  {index}. {option.get('label')}: {option.get('description')}")
             prompt = "answer> "
             try:
-                raw = (
-                    getpass.getpass(prompt)
-                    if question.get("isSecret")
-                    else self._read_line(prompt)
+                raw = self._read_interactive_response(
+                    prompt,
+                    secret=bool(question.get("isSecret")),
                 )
             except (EOFError, KeyboardInterrupt):
                 print()
@@ -1635,7 +1704,9 @@ class VeyraClient:
             print(params["reason"])
         print(json.dumps(params.get("permissions") or {}, indent=2, ensure_ascii=True))
         try:
-            answer = self._read_line("grant for this turn? [y/N] > ").strip().lower()
+            answer = self._read_interactive_response(
+                "grant for this turn? [y/N] > "
+            ).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
             answer = ""
@@ -1681,8 +1752,18 @@ class VeyraClient:
             reason = str(arguments.get("reason", "")).strip()
             if not reason:
                 raise VeyraError("a routing reason is required")
+            continue_task = arguments.get("continue_task")
+            if not isinstance(continue_task, bool):
+                raise VeyraError("continue_task must be true or false")
             self._schedule_route(target, effort, reason)
-            text = f"Scheduled {target.route_id}/{effort} for the next turn: {reason}"
+            self._route_continuation_requested = continue_task
+            continuation = (
+                "; automatic continuation requested" if continue_task else ""
+            )
+            text = (
+                f"Scheduled {target.route_id}/{effort} for the next turn: {reason}"
+                f"{continuation}"
+            )
             print(self.palette.dim(f"\n[route] {text}"))
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
@@ -1699,11 +1780,17 @@ class VeyraClient:
             reason = str(arguments.get("reason", "")).strip()
             if not reason:
                 raise VeyraError("an attention reason is required")
+            continue_task = arguments.get("continue_task")
+            if not isinstance(continue_task, bool):
+                raise VeyraError("continue_task must be true or false")
             self._schedule_route(target, effort, reason)
+            self._route_continuation_requested = continue_task
             text = (
                 f"Scheduled {target.route_id}/{effort} attention for the next turn: "
                 f"{reason}"
             )
+            if continue_task:
+                text += "; automatic continuation requested"
             print(self.palette.dim(f"\n[attention] {text}"))
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
@@ -2185,6 +2272,10 @@ class VeyraClient:
             },
         )
 
+    def _read_interactive_response(self, prompt: str, *, secret: bool = False) -> str:
+        """Read an approval or elicitation response during a foreground turn."""
+        return getpass.getpass(prompt) if secret else self._read_line(prompt)
+
     def repl(self) -> None:
         self._start_terminal_ui()
         try:
@@ -2268,7 +2359,7 @@ class VeyraClient:
                 "/jobs                  show background worker jobs\n"
                 "/job ID                show one background worker report\n"
                 "/cancel-job ID         interrupt a background worker\n"
-                "/fork [MODEL] [EFFORT] branch history and enter the fork\n"
+                "/branch [MODEL] [EFFORT] enter an explicit history branch\n"
                 "/new                   start an empty thread\n"
                 "/threads               list recent threads\n"
                 "/resume THREAD_ID      resume a thread\n"
@@ -2371,8 +2462,13 @@ class VeyraClient:
             if len(args) != 1:
                 raise VeyraError("usage: /cancel-job ID")
             self._cancel_worker_job(args[0])
-        elif command == "/fork":
+        elif command == "/branch":
             self.fork(args[0] if args else None, args[1] if len(args) > 1 else None)
+        elif command == "/fork":
+            raise VeyraError(
+                "/fork no longer switches the foreground thread; use /branch for an "
+                "explicit alternate history, or ask Veyra to delegate background work"
+            )
         elif command == "/new":
             if self.thread_id:
                 self._release_thread_events(self.thread_id)
@@ -2451,6 +2547,24 @@ class VeyraClient:
             + self._background_status_suffix()
             + " "
             "]"
+        )
+
+    def _show_turn_start_status(
+        self, previous_model: Model, previous_effort: str
+    ) -> None:
+        """Show the accepted route as soon as a turn becomes active."""
+        model = self.model.model_id.removeprefix("gpt-5.6-")
+        previous = previous_model.model_id.removeprefix("gpt-5.6-")
+        parts = [f"Veyra {model}/{self.effort}", "turn started"]
+        if previous_model.route_id != self.model.route_id:
+            parts.append(f"model {previous} -> {model}")
+        if previous_effort != self.effort:
+            parts.append(f"attention {previous_effort} -> {self.effort}")
+        self._render_status_bar(
+            "[ "
+            + " | ".join(parts)
+            + self._background_status_suffix()
+            + " ]"
         )
 
     def _background_status_suffix(self) -> str:
@@ -2542,13 +2656,13 @@ class VeyraClient:
             self.status_bar_visible = True
 
     def _start_terminal_ui(self) -> None:
-        """Enter a full-screen terminal surface with one non-scrolling row."""
+        """Reserve one status row while retaining primary-screen scrollback."""
         if not self.status_bar_enabled or self.terminal_ui_active:
             return
         self.terminal_size = shutil.get_terminal_size(fallback=(80, 24))
         scroll_bottom = max(1, self.terminal_size.lines - 1)
         sys.stdout.write(
-            "\033[?1049h\033[2J\033[H"
+            "\033[2J\033[H"
             f"\033[1;{scroll_bottom}r"
         )
         sys.stdout.flush()
@@ -2592,7 +2706,7 @@ class VeyraClient:
         if not self.terminal_ui_active:
             return
         self._clear_status_bar()
-        sys.stdout.write("\033[r\033[?1049l")
+        sys.stdout.write(f"\033[r\033[{self.terminal_size.lines};1H\r\n")
         sys.stdout.flush()
         self.terminal_ui_active = False
         if hasattr(signal, "SIGWINCH") and self.previous_resize_handler is not None:
