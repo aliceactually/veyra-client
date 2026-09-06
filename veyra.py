@@ -5,11 +5,14 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import getpass
 import json
 import os
 import queue
 import re
+import secrets
+import select
 import signal
 try:
     # Explicitly enable editable input and terminal history where Python ships
@@ -20,10 +23,17 @@ except ImportError:  # pragma: no cover - platform-dependent optional module
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+try:
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - non-POSIX terminal fallback
+    termios = None
+    tty = None
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,7 +41,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.9.0"
+CLIENT_VERSION = "0.10.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
 COGNITIVE_MODES = {
@@ -76,12 +86,16 @@ READLINE_PROMPT_END_IGNORE = "\x02"
 ROUTE_TOOL = "request_model_route"
 ATTENTION_TOOL = "request_attention"
 USER_PROMPT_TOOL = "set_user_prompt"
+BORROW_CLIPBOARD_SECRET_TOOL = "borrow_clipboard_secret"
+RETAIN_CLIPBOARD_SECRET_TOOL = "retain_clipboard_secret"
 LOCAL_AGENT_TOOL = "run_local_agent"
 WORKER_AGENT_TOOL = "run_worker_agent"
 SPAWN_WORKER_AGENT_TOOL = "spawn_worker_agent"
 BACKGROUND_WORKER_RESULT_TOOL = "background_worker_result"
 ROUTE_CONTINUATION_TOOL = "route_change_continuation"
 MAX_BACKGROUND_WORKERS = 3
+TURN_INPUT_POLL_SECONDS = 0.05
+TURN_ESCAPE_GRACE_SECONDS = 0.04
 PROMPT_COLOURS = {
     "blue": "34",
     "cyan": "36",
@@ -93,6 +107,11 @@ PROMPT_COLOURS = {
 }
 USER_PROMPT_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._'-]{0,31}")
 USER_PROMPT_PREFERENCES_VERSION = 1
+SECRET_DESCRIPTION_PATTERN = re.compile(r"[ -~]{1,200}")
+MAX_CLIPBOARD_SECRET_BYTES = 64 * 1024
+DEFAULT_SECRET_EXPIRY_SECONDS = 120
+MIN_SECRET_EXPIRY_SECONDS = 30
+MAX_SECRET_EXPIRY_SECONDS = 300
 LOCAL_ENDPOINTS = {
     "ollama": "http://127.0.0.1:11434/api/tags",
     "lmstudio": "http://127.0.0.1:1234/v1/models",
@@ -101,6 +120,164 @@ LOCAL_ENDPOINTS = {
 
 class VeyraError(RuntimeError):
     """A user-facing client error."""
+
+
+class TurnInputEditor:
+    """Small turn-time editor for queued input and Escape interruption."""
+
+    _ESCAPE_ACTIONS = {
+        b"\x1b[A": "up",
+        b"\x1b[B": "down",
+        b"\x1b[C": "right",
+        b"\x1b[D": "left",
+        b"\x1b[H": "home",
+        b"\x1b[F": "end",
+        b"\x1bOH": "home",
+        b"\x1bOF": "end",
+        b"\x1b[1~": "home",
+        b"\x1b[3~": "delete",
+        b"\x1b[4~": "end",
+        b"\x1b[7~": "home",
+        b"\x1b[8~": "end",
+    }
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.cursor = 0
+        self.submitted: list[str] = []
+        self._escape = bytearray()
+        self._escape_deadline: float | None = None
+
+    @property
+    def escape_pending(self) -> bool:
+        return bool(self._escape)
+
+    def feed(self, data: bytes, *, now: float | None = None) -> set[str]:
+        """Consume terminal bytes and report changed, submitted or interrupt."""
+        actions: set[str] = set()
+        timestamp = time.monotonic() if now is None else now
+        for value in data:
+            if self._escape:
+                self._escape.append(value)
+                sequence = bytes(self._escape)
+                exact = self._ESCAPE_ACTIONS.get(sequence)
+                longer = any(
+                    candidate.startswith(sequence) and candidate != sequence
+                    for candidate in self._ESCAPE_ACTIONS
+                )
+                if exact is not None and not longer:
+                    self._apply_escape_action(exact)
+                    self._clear_escape()
+                    actions.add("changed")
+                elif not any(
+                    candidate.startswith(sequence)
+                    for candidate in self._ESCAPE_ACTIONS
+                ):
+                    # Swallow a complete unknown CSI sequence. This also strips
+                    # bracketed-paste wrappers while retaining the pasted text.
+                    if sequence.startswith(b"\x1b[") and not 0x40 <= value <= 0x7E:
+                        continue
+                    self._clear_escape()
+                continue
+            if value == 0x1B:
+                self._escape.append(value)
+                self._escape_deadline = timestamp + TURN_ESCAPE_GRACE_SECONDS
+            elif value in {0x03}:
+                actions.add("interrupt")
+            elif value in {0x0A, 0x0D}:
+                if self.text.strip():
+                    self.submitted.append(self.text)
+                    self.text = ""
+                    self.cursor = 0
+                    actions.update({"changed", "submitted"})
+            elif value in {0x08, 0x7F}:
+                if self.cursor:
+                    self.text = self.text[: self.cursor - 1] + self.text[self.cursor :]
+                    self.cursor -= 1
+                    actions.add("changed")
+            elif value == 0x15:  # Ctrl-U
+                if self.text:
+                    self.text = ""
+                    self.cursor = 0
+                    actions.add("changed")
+            elif 0x20 <= value <= 0x7E:
+                character = chr(value)
+                self.text = self.text[: self.cursor] + character + self.text[self.cursor :]
+                self.cursor += 1
+                actions.add("changed")
+        return actions
+
+    def expire_escape(self, *, now: float | None = None) -> bool:
+        """Treat a lone Escape as interrupt after terminal-sequence grace."""
+        if not self._escape or self._escape_deadline is None:
+            return False
+        timestamp = time.monotonic() if now is None else now
+        if timestamp < self._escape_deadline:
+            return False
+        lone_escape = bytes(self._escape) == b"\x1b"
+        self._clear_escape()
+        return lone_escape
+
+    def display(self) -> str:
+        """Render the draft with a visible logical cursor for the status row."""
+        return self.text[: self.cursor] + "|" + self.text[self.cursor :]
+
+    def _apply_escape_action(self, action: str) -> None:
+        if action == "left":
+            self.cursor = max(0, self.cursor - 1)
+        elif action == "right":
+            self.cursor = min(len(self.text), self.cursor + 1)
+        elif action == "home":
+            self.cursor = 0
+        elif action == "end":
+            self.cursor = len(self.text)
+        elif action == "delete" and self.cursor < len(self.text):
+            self.text = self.text[: self.cursor] + self.text[self.cursor + 1 :]
+
+    def _clear_escape(self) -> None:
+        self._escape.clear()
+        self._escape_deadline = None
+
+
+class TurnTerminalInput:
+    """Temporarily place a real terminal in non-echoing cbreak mode."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.fd: int | None = None
+        self.original: Any = None
+        self.active = False
+        if termios is None or tty is None:
+            return
+        try:
+            if stream.isatty():
+                self.fd = stream.fileno()
+                self.original = termios.tcgetattr(self.fd)
+        except (AttributeError, OSError, ValueError):
+            self.fd = None
+            self.original = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.fd is not None and self.original is not None
+
+    def resume(self) -> None:
+        if self.enabled and not self.active:
+            assert self.fd is not None
+            tty.setcbreak(self.fd, termios.TCSANOW)
+            self.active = True
+
+    def pause(self) -> None:
+        if self.enabled and self.active:
+            assert self.fd is not None
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.original)
+            self.active = False
+
+    def read_ready(self) -> bytes:
+        if not self.active or self.fd is None:
+            return b""
+        readable, _, _ = select.select([self.fd], [], [], 0)
+        return os.read(self.fd, 64) if readable else b""
 
 
 def readline_safe_prompt(prompt: str) -> str:
@@ -488,6 +665,17 @@ class WorkerJob:
     worker_thread_id: str | None = None
     worker_turn_id: str | None = None
     delivered: bool = False
+
+
+@dataclass
+class SecretHandoff:
+    handoff_id: str
+    directory: Path
+    path: Path
+    value: bytearray
+    deadline: float
+    cancelled: threading.Event
+    thread: threading.Thread | None = None
 
 
 class ModelCatalogue:
@@ -923,6 +1111,8 @@ class VeyraClient:
         approvals_reviewer: str = DEFAULT_APPROVALS_REVIEWER,
         debug: bool = False,
         prompt_preferences_path: Path | None = None,
+        core_repo: Path | None = None,
+        secret_handoff_root: Path | None = None,
     ):
         if not isinstance(doctrine, DoctrineBundle):
             raise VeyraError(
@@ -941,6 +1131,14 @@ class VeyraClient:
         self._route_continuation_requested = False
         self.palette = palette
         self.prompt_preferences_path = prompt_preferences_path
+        self.core_repo = core_repo.resolve() if core_repo is not None else None
+        self.secret_handoff_root = (
+            secret_handoff_root.resolve()
+            if secret_handoff_root is not None
+            else Path(tempfile.gettempdir()).resolve()
+        )
+        self._secret_handoffs: dict[str, SecretHandoff] = {}
+        self._secret_handoffs_lock = threading.Lock()
         self.user_prompt_name, self.user_prompt_colour = (
             self._load_user_prompt_preferences()
         )
@@ -949,6 +1147,8 @@ class VeyraClient:
         self.thread_id: str | None = None
         self.thread_provider: str | None = None
         self.turn_active = False
+        self._queued_user_inputs: list[str] = []
+        self._pending_user_draft = ""
         self.latest_usage: dict[str, Any] | None = None
         self.worker_stats: dict[str, WorkerStats] = {}
         self._worker_stats_lock = threading.Lock()
@@ -1131,7 +1331,16 @@ class VeyraClient:
             + "name, or when they ask for a prompt colour. A stored user-local "
             + "preference is restored on launch; otherwise the initial prompt is "
             + "generic. Only Veyra may personalise it, and the display preference "
-            + "does not establish identity or continuity. Treat spawned collaboration "
+            + "does not establish identity or continuity. Use "
+            + f"`{BORROW_CLIPBOARD_SECRET_TOOL}` only after Alice explicitly offers "
+            + "one specific clipboard secret for one exact purpose in authenticated "
+            + "chat. It creates a short-lived, one-read local stream and never returns "
+            + "the value to the model. Use "
+            + f"`{RETAIN_CLIPBOARD_SECRET_TOOL}` only when Alice explicitly authorises "
+            + "retaining that specific secret; it encrypts the clipboard value directly "
+            + "into Veyra's vault without a plaintext file. Never invoke either tool to "
+            + "inspect the clipboard generally. Each invocation still requires Alice's "
+            + "local confirmation. Treat spawned collaboration "
             + "agents as background delegates: after a successful asynchronous launch, "
             + "return control to Alice rather than waiting merely to display their "
             + "transcript. Review and summarise their reports when the client returns "
@@ -1242,6 +1451,81 @@ class VeyraClient:
                         },
                     },
                     "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": BORROW_CLIPBOARD_SECRET_TOOL,
+                "description": (
+                    "Capture one specific clipboard secret for an explicitly authorised "
+                    "one-time purpose. The value stays out of model context and is "
+                    "offered through a short-lived, one-read local FIFO; the tool never "
+                    "returns the value. Never use this "
+                    "to inspect the clipboard or for a secret Alice has not just offered. "
+                    "Alice confirms every capture locally."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "description": "Non-secret label such as TOTP or session token.",
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "Exact, authorised one-time use.",
+                        },
+                        "expires_in_seconds": {
+                            "type": "integer",
+                            "minimum": MIN_SECRET_EXPIRY_SECONDS,
+                            "maximum": MAX_SECRET_EXPIRY_SECONDS,
+                            "description": "How long the unread handoff remains available.",
+                        },
+                    },
+                    "required": ["kind", "purpose"],
+                    "additionalProperties": False,
+                },
+            },
+            {
+                "type": "function",
+                "name": RETAIN_CLIPBOARD_SECRET_TOOL,
+                "description": (
+                    "Encrypt one specifically authorised clipboard secret directly into "
+                    "Veyra's vault without exposing it to the model or a plaintext file. "
+                    "Use only when Alice explicitly authorises retention of that exact "
+                    "secret. Alice confirms every capture locally."
+                ),
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Non-secret name."},
+                        "owner": {
+                            "type": "string",
+                            "description": "Credential owner; defaults to Veyra.",
+                        },
+                        "kind": {"type": "string", "description": "Secret type."},
+                        "purpose": {"type": "string", "description": "Exact use."},
+                        "scope": {
+                            "type": "string",
+                            "description": "Systems and permissions the secret covers.",
+                        },
+                        "fingerprint": {
+                            "type": "string",
+                            "description": "Optional non-secret fingerprint.",
+                        },
+                        "authorisation": {
+                            "type": "string",
+                            "description": "Current explicit authorisation from Alice.",
+                        },
+                    },
+                    "required": [
+                        "name",
+                        "kind",
+                        "purpose",
+                        "scope",
+                        "authorisation",
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -1514,6 +1798,12 @@ class VeyraClient:
 
     def run_turn(self, text: str) -> None:
         self._run_turn([{"type": "text", "text": text}])
+        while self._queued_user_inputs:
+            queued = self._queued_user_inputs.pop(0)
+            # A real user message fulfils any requested route continuation itself.
+            self._route_continuation_requested = False
+            print(self.palette.dim("\n[queued input] starting the next turn"))
+            self._run_turn([{"type": "text", "text": queued}])
         self._deliver_route_continuation()
 
     def _deliver_route_continuation(self) -> bool:
@@ -1597,14 +1887,60 @@ class VeyraClient:
         self.pending_route = None
         self.turn_active = True
         wrote_agent_text = False
+        turn_terminal = TurnTerminalInput(sys.stdin)
+        turn_editor = TurnInputEditor()
+        interrupt_sent = False
         try:
             self._show_turn_start_status(previous_model, previous_effort)
+            turn_terminal.resume()
+            if turn_terminal.enabled:
+                self._show_turn_input_status(turn_editor)
             while True:
-                message = events.get()
+                message: dict[str, Any] | None = None
+                actions: set[str] = set()
+                try:
+                    if turn_terminal.enabled:
+                        try:
+                            message = events.get(timeout=TURN_INPUT_POLL_SECONDS)
+                        except queue.Empty:
+                            pass
+                        actions.update(turn_editor.feed(turn_terminal.read_ready()))
+                        if turn_editor.expire_escape():
+                            actions.add("interrupt")
+                    else:
+                        message = events.get()
+                except KeyboardInterrupt:
+                    # At the prompt Ctrl-C exits; during a turn it cancels only the turn.
+                    actions.add("interrupt")
+                if "changed" in actions:
+                    self._show_turn_input_status(turn_editor)
+                if "interrupt" in actions and not interrupt_sent:
+                    interrupt_sent = True
+                    turn_terminal.pause()
+                    try:
+                        self.server.request(
+                            "turn/interrupt",
+                            {"threadId": self.thread_id, "turnId": turn_id},
+                        )
+                    except KeyboardInterrupt:
+                        # A second Ctrl-C cannot make the cancellation more cancelled.
+                        pass
+                    finally:
+                        turn_terminal.resume()
+                    self._render_status_bar(
+                        "[ Veyra | interrupt requested | waiting for turn to stop ]"
+                    )
+                if message is None:
+                    continue
                 method = message.get("method")
                 params = message.get("params") or {}
                 if "id" in message and method:
-                    self._handle_server_request(message)
+                    # Readline/getpass approval prompts require the normal cooked mode.
+                    turn_terminal.pause()
+                    try:
+                        self._handle_server_request(message)
+                    finally:
+                        turn_terminal.resume()
                     continue
                 if params.get("threadId") not in {None, self.thread_id}:
                     continue
@@ -1646,6 +1982,10 @@ class VeyraClient:
                         self._show_stat_bar()
                         break
         finally:
+            turn_terminal.pause()
+            self._queued_user_inputs.extend(turn_editor.submitted)
+            if turn_editor.text:
+                self._pending_user_draft = turn_editor.text
             self.turn_active = False
 
     def _show_item_started(self, item: dict[str, Any]) -> None:
@@ -1775,6 +2115,10 @@ class VeyraClient:
             self._handle_attention(request_id, arguments)
         elif tool == USER_PROMPT_TOOL:
             self._handle_user_prompt(request_id, arguments)
+        elif tool == BORROW_CLIPBOARD_SECRET_TOOL:
+            self._handle_borrow_clipboard_secret(request_id, arguments)
+        elif tool == RETAIN_CLIPBOARD_SECRET_TOOL:
+            self._handle_retain_clipboard_secret(request_id, arguments)
         elif tool == WORKER_AGENT_TOOL:
             self._handle_worker_agent(request_id, arguments)
         elif tool == SPAWN_WORKER_AGENT_TOOL:
@@ -1859,6 +2203,318 @@ class VeyraClient:
             self._tool_response(request_id, True, text)
         except VeyraError as exc:
             self._tool_response(request_id, False, f"Prompt change rejected: {exc}")
+
+    @staticmethod
+    def _secret_description(value: Any, field: str) -> str:
+        text = str(value or "").strip()
+        if not SECRET_DESCRIPTION_PATTERN.fullmatch(text):
+            raise VeyraError(
+                f"{field} must be 1-200 printable ASCII characters"
+            )
+        return text
+
+    def _confirm_clipboard_capture(self, heading: str, fields: list[str]) -> bool:
+        print(self.palette.warning(f"\n{heading}"))
+        for field in fields:
+            print(self.palette.dim(field))
+        try:
+            answer = self._read_interactive_response(
+                "read the clipboard once and clear it if unchanged? [y/N] > "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return answer in {"y", "yes"}
+
+    @staticmethod
+    def _read_clipboard_bytes(*, require_nonempty: bool) -> bytes:
+        executable = shutil.which("pbpaste")
+        if executable is None:
+            raise VeyraError("the macOS pbpaste command is unavailable")
+        process = subprocess.Popen(
+            [executable],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        assert process.stdout is not None
+        value = process.stdout.read(MAX_CLIPBOARD_SECRET_BYTES + 1)
+        process.stdout.close()
+        if len(value) > MAX_CLIPBOARD_SECRET_BYTES:
+            process.terminate()
+            process.wait()
+            raise VeyraError("clipboard secret exceeds the 64 KiB handoff limit")
+        returncode = process.wait()
+        if returncode != 0:
+            raise VeyraError("could not read the system clipboard")
+        if require_nonempty and not value:
+            raise VeyraError("the system clipboard is empty")
+        return value
+
+    @classmethod
+    def _read_system_clipboard(cls) -> bytes:
+        return cls._read_clipboard_bytes(require_nonempty=True)
+
+    @staticmethod
+    def _clear_system_clipboard_if_unchanged(original: bytes) -> bool:
+        copy = shutil.which("pbcopy")
+        if copy is None:
+            raise VeyraError("the macOS clipboard commands are unavailable")
+        current = VeyraClient._read_clipboard_bytes(require_nonempty=False)
+        if current != original:
+            return False
+        cleared = subprocess.run(
+            [copy],
+            input=b"",
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if cleared.returncode != 0:
+            raise VeyraError("could not clear the system clipboard")
+        return True
+
+    def _create_secret_handoff(self, value: bytes, expires_in: int) -> SecretHandoff:
+        self.secret_handoff_root.mkdir(parents=True, exist_ok=True)
+        directory = Path(
+            tempfile.mkdtemp(prefix="veyra-secret-", dir=self.secret_handoff_root)
+        )
+        try:
+            directory.chmod(0o700)
+            path = directory / "read-once"
+            os.mkfifo(path, 0o600)
+        except OSError:
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+            raise
+        handoff = SecretHandoff(
+            handoff_id=secrets.token_hex(8),
+            directory=directory,
+            path=path,
+            value=bytearray(value),
+            deadline=time.monotonic() + expires_in,
+            cancelled=threading.Event(),
+        )
+        thread = threading.Thread(
+            target=self._serve_secret_handoff,
+            args=(handoff,),
+            name=f"veyra-secret-{handoff.handoff_id}",
+            daemon=True,
+        )
+        handoff.thread = thread
+        with self._secret_handoffs_lock:
+            self._secret_handoffs[handoff.handoff_id] = handoff
+        thread.start()
+        return handoff
+
+    def _serve_secret_handoff(self, handoff: SecretHandoff) -> None:
+        descriptor: int | None = None
+        try:
+            while not handoff.cancelled.is_set():
+                remaining = handoff.deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    descriptor = os.open(
+                        handoff.path,
+                        os.O_WRONLY | os.O_NONBLOCK,
+                    )
+                except OSError as exc:
+                    if exc.errno == errno.ENXIO:
+                        handoff.cancelled.wait(min(0.05, remaining))
+                        continue
+                    if exc.errno == errno.ENOENT and handoff.cancelled.is_set():
+                        break
+                    raise
+                os.set_blocking(descriptor, True)
+                view = memoryview(handoff.value)
+                while view:
+                    written = os.write(descriptor, view)
+                    view = view[written:]
+                break
+        except (BrokenPipeError, OSError):
+            pass
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            for index in range(len(handoff.value)):
+                handoff.value[index] = 0
+            try:
+                handoff.path.unlink(missing_ok=True)
+                handoff.directory.rmdir()
+            except OSError:
+                pass
+            with self._secret_handoffs_lock:
+                self._secret_handoffs.pop(handoff.handoff_id, None)
+
+    def _discard_secret_handoffs(self) -> None:
+        with self._secret_handoffs_lock:
+            handoffs = list(self._secret_handoffs.values())
+        for handoff in handoffs:
+            handoff.cancelled.set()
+            try:
+                handoff.path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for handoff in handoffs:
+            if handoff.thread is not None:
+                handoff.thread.join(timeout=0.25)
+
+    def _handle_borrow_clipboard_secret(
+        self, request_id: Any, arguments: dict[str, Any]
+    ) -> None:
+        try:
+            kind = self._secret_description(arguments.get("kind"), "kind")
+            purpose = self._secret_description(arguments.get("purpose"), "purpose")
+            expires_in = arguments.get(
+                "expires_in_seconds", DEFAULT_SECRET_EXPIRY_SECONDS
+            )
+            if isinstance(expires_in, bool) or not isinstance(expires_in, int):
+                raise VeyraError("expires_in_seconds must be an integer")
+            if not MIN_SECRET_EXPIRY_SECONDS <= expires_in <= MAX_SECRET_EXPIRY_SECONDS:
+                raise VeyraError(
+                    f"expires_in_seconds must be {MIN_SECRET_EXPIRY_SECONDS}-"
+                    f"{MAX_SECRET_EXPIRY_SECONDS}"
+                )
+            if not self._confirm_clipboard_capture(
+                "Veyra requests a one-use clipboard secret.",
+                [f"kind: {kind}", f"purpose: {purpose}", f"expiry: {expires_in}s"],
+            ):
+                raise VeyraError("Alice declined the clipboard handoff")
+            value = self._read_system_clipboard()
+            handoff = self._create_secret_handoff(value, expires_in)
+            try:
+                clipboard_cleared = self._clear_system_clipboard_if_unchanged(value)
+                clipboard_status = (
+                    "cleared" if clipboard_cleared else "changed; not cleared"
+                )
+            except VeyraError:
+                clipboard_status = "clear failed; remove it manually"
+            receipt = {
+                "status": "ready",
+                "handoff_id": handoff.handoff_id,
+                "path": str(handoff.path),
+                "expires_in_seconds": expires_in,
+                "clipboard": clipboard_status,
+                "instruction": (
+                    "Read this FIFO exactly once before expiry, never print its value, "
+                    "and pass it only to the authorised consumer."
+                ),
+            }
+            print(
+                self.palette.dim(
+                    f"\n[secret] one-use handoff {handoff.handoff_id} ready"
+                )
+            )
+            self._tool_response(
+                request_id, True, json.dumps(receipt, ensure_ascii=True)
+            )
+        except VeyraError as exc:
+            self._tool_response(request_id, False, f"Clipboard handoff rejected: {exc}")
+
+    def _store_secret_in_vault(
+        self, value: bytes, metadata: dict[str, str]
+    ) -> str:
+        if self.core_repo is None:
+            raise VeyraError("Veyra Core was not supplied to the client")
+        script = self.core_repo / "scripts" / "veyra-vault.py"
+        if not script.is_file():
+            raise VeyraError("Veyra Core vault command is unavailable")
+        command = [
+            sys.executable,
+            str(script),
+            "put-stdin",
+            "--name",
+            metadata["name"],
+            "--owner",
+            metadata["owner"],
+            "--kind",
+            metadata["kind"],
+            "--purpose",
+            metadata["purpose"],
+            "--scope",
+            metadata["scope"],
+            "--authorisation",
+            metadata["authorisation"],
+        ]
+        if metadata.get("fingerprint"):
+            command.extend(["--fingerprint", metadata["fingerprint"]])
+        stored = subprocess.run(
+            command,
+            input=value,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if stored.returncode != 0:
+            raise VeyraError("vault encryption failed; no secret value was displayed")
+        match = re.fullmatch(rb"Stored secret ([0-9a-f]{32}):[^\r\n]*\r?\n?", stored.stdout)
+        if match is None:
+            raise VeyraError("vault returned an invalid non-secret receipt")
+        return match.group(1).decode("ascii")
+
+    def _handle_retain_clipboard_secret(
+        self, request_id: Any, arguments: dict[str, Any]
+    ) -> None:
+        try:
+            metadata = {
+                field: self._secret_description(arguments.get(field), field)
+                for field in ("name", "kind", "purpose", "scope", "authorisation")
+            }
+            metadata["owner"] = self._secret_description(
+                arguments.get("owner", "Veyra"), "owner"
+            )
+            fingerprint = arguments.get("fingerprint")
+            metadata["fingerprint"] = (
+                self._secret_description(fingerprint, "fingerprint")
+                if fingerprint is not None
+                else ""
+            )
+            if not self._confirm_clipboard_capture(
+                "Veyra requests permission to retain a clipboard secret.",
+                [
+                    f"name: {metadata['name']}",
+                    f"owner: {metadata['owner']}",
+                    f"kind: {metadata['kind']}",
+                    f"purpose: {metadata['purpose']}",
+                    f"scope: {metadata['scope']}",
+                    "destination: encrypted Veyra vault",
+                ],
+            ):
+                raise VeyraError("Alice declined retention of the clipboard secret")
+            value = self._read_system_clipboard()
+            try:
+                identifier = self._store_secret_in_vault(value, metadata)
+            except VeyraError:
+                try:
+                    self._clear_system_clipboard_if_unchanged(value)
+                except VeyraError:
+                    pass
+                raise
+            try:
+                clipboard_cleared = self._clear_system_clipboard_if_unchanged(value)
+                clipboard_status = (
+                    "cleared" if clipboard_cleared else "changed; not cleared"
+                )
+            except VeyraError:
+                clipboard_status = "clear failed; remove it manually"
+            receipt = {
+                "status": "retained",
+                "vault_id": identifier,
+                "name": metadata["name"],
+                "clipboard": clipboard_status,
+                "secret_value_exposed": False,
+            }
+            print(self.palette.dim(f"\n[secret] retained as vault item {identifier}"))
+            self._tool_response(
+                request_id, True, json.dumps(receipt, ensure_ascii=True)
+            )
+        except VeyraError as exc:
+            self._tool_response(request_id, False, f"Secret retention rejected: {exc}")
 
     def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
         self._require_veyra_host(target)
@@ -2329,7 +2985,7 @@ class VeyraClient:
             print(self.palette.dim("/help for commands"))
             while True:
                 try:
-                    text = self._read_line(self.user_prompt).strip()
+                    text = self._read_user_line().strip()
                 except (EOFError, KeyboardInterrupt):
                     print()
                     break
@@ -2353,6 +3009,7 @@ class VeyraClient:
                 except VeyraError as exc:
                     print(self.palette.warning(f"error: {exc}"), file=sys.stderr)
         finally:
+            self._discard_secret_handoffs()
             self._stop_terminal_ui()
 
     @staticmethod
@@ -2372,6 +3029,23 @@ class VeyraClient:
         if readline is not None and text:
             readline.add_history(text)
         return text
+
+    def _read_user_line(self) -> str:
+        """Read the normal prompt, restoring any unfinished turn-time draft."""
+        draft = self._pending_user_draft
+        self._pending_user_draft = ""
+        if not draft or readline is None or not hasattr(readline, "set_startup_hook"):
+            return self._read_line(self.user_prompt)
+
+        def restore_draft() -> None:
+            readline.insert_text(draft)
+            readline.redisplay()
+
+        readline.set_startup_hook(restore_draft)
+        try:
+            return self._read_line(self.user_prompt)
+        finally:
+            readline.set_startup_hook()
 
     def _command(self, text: str) -> bool:
         parts = text.split()
@@ -2659,6 +3333,18 @@ class VeyraClient:
             + " ]"
         )
 
+    def _show_turn_input_status(self, editor: TurnInputEditor) -> None:
+        """Show turn-time queued input without disturbing streamed output."""
+        queued = len(editor.submitted)
+        if editor.text:
+            detail = f"next> {editor.display()}"
+        elif queued:
+            suffix = "s" if queued != 1 else ""
+            detail = f"{queued} next message{suffix} queued"
+        else:
+            detail = "turn active"
+        self._render_status_bar(f"[ Veyra | {detail} | Esc interrupts ]")
+
     def _background_status_suffix(self) -> str:
         with self._worker_jobs_lock:
             running = sum(
@@ -2887,6 +3573,7 @@ def main(argv: list[str] | None = None) -> int:
             approvals_reviewer=args.approvals_reviewer,
             debug=args.debug,
             prompt_preferences_path=user_prompt_preferences_path(),
+            core_repo=args.core,
         )
         if args.smoke:
             client.start_thread(ephemeral=True)

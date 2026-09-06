@@ -3,10 +3,12 @@
 A small, dependency-free terminal client for Codex App Server. It keeps the
 surface deliberately narrow: conversation, atomic cognitive-profile routing,
 thread forking, local workers, circadian memory hand-off, token usage, and
-approval prompts.
+approval prompts. It also provides locally confirmed clipboard-secret hand-offs
+that keep values out of model context.
 
 It uses the existing Codex CLI authentication and sandbox. It does not read or
-store API keys.
+store API keys unless Alice explicitly approves retaining one directly in
+Veyra Core's encrypted vault.
 
 ## Requirements
 
@@ -78,6 +80,26 @@ Sol-medium through the existing Codex CLI login. It writes a shuffled A/B review
 file and a separate identity key to the chosen output directory. Score
 `blinded.json` before opening `key.json`; generated responses are deliberately
 not retained in the repository.
+
+## Clipboard secret hand-offs
+
+Veyra may request a clipboard secret only after Alice explicitly offers that
+specific value for an exact purpose in authenticated chat. Every request shows
+non-secret metadata in the local terminal and requires a separate confirmation
+before the clipboard is read.
+
+`borrow_clipboard_secret` keeps the captured value in client memory and exposes
+it as a mode `0600` FIFO inside a mode `0700` temporary directory. The FIFO can
+be read once, expires after 30-300 seconds, and is removed after consumption or
+expiry. Its value is never returned through App Server or written to a regular
+file. `retain_clipboard_secret` instead pipes the value directly into Veyra
+Core's encrypted vault and returns only the opaque vault identifier.
+
+After either capture, the client clears the macOS clipboard only if it still
+contains the captured value; a newer clipboard value is left untouched. This
+cannot erase copies already retained by clipboard history or device-sync tools.
+There is no passive clipboard monitoring and no user slash command that bypasses
+Veyra's authorisation boundary.
 
 ## Commands
 
@@ -184,7 +206,11 @@ are excluded from GNU Readline's width calculations. The libedit compatibility
 layer used by macOS receives an equal-width, zero-column placeholder after the
 coloured prompt is rendered and reset. Long input can therefore wrap across
 terminal rows while arrow movement, insertion and deletion continue to redraw
-at the correct cursor position.
+at the correct cursor position. While Veyra's turn is active, the reserved row
+becomes a compact editor for the next message: arrow keys edit without leaking
+terminal escape codes, Enter queues the text as the next user turn, and an
+unfinished draft returns at the normal prompt. Escape or Ctrl-C interrupts only
+the active turn; Ctrl-C at the normal prompt still exits the client.
 
 Without a stored preference, a session begins with the generic `user>` prompt.
 After Veyra learns the current person's preferred name, she can use the

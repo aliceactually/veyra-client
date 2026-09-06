@@ -1,7 +1,10 @@
 import importlib.util
 import io
 import json
+import os
+import pty
 import queue
+import stat
 import sys
 import tempfile
 import threading
@@ -148,6 +151,72 @@ class PaletteTests(unittest.TestCase):
         self.assertEqual(palette.colour("magenta", "Alice> "), "\033[35mAlice> \033[0m")
         with self.assertRaisesRegex(veyra.VeyraError, "unknown prompt colour"):
             palette.colour("ultraviolet", "Alice> ")
+
+
+class TurnInputTests(unittest.TestCase):
+    def test_turn_editor_handles_arrows_editing_and_submission(self):
+        editor = veyra.TurnInputEditor()
+        self.assertEqual(editor.feed(b"helo"), {"changed"})
+        editor.feed(b"\x1b[D")
+        editor.feed(b"l")
+        self.assertEqual(editor.text, "hello")
+        self.assertEqual(editor.display(), "hell|o")
+        editor.feed(b"\x1b[C")
+        self.assertEqual(editor.display(), "hello|")
+        self.assertEqual(editor.feed(b"\r"), {"changed", "submitted"})
+        self.assertEqual(editor.submitted, ["hello"])
+        self.assertEqual(editor.text, "")
+
+    def test_arrow_sequences_do_not_become_escape_interrupts(self):
+        editor = veyra.TurnInputEditor()
+        editor.feed(b"abc")
+        editor.feed(b"\x1b[D", now=1.0)
+        self.assertFalse(editor.expire_escape(now=2.0))
+        self.assertEqual(editor.display(), "ab|c")
+
+    def test_unknown_and_bracketed_paste_sequences_do_not_leak(self):
+        editor = veyra.TurnInputEditor()
+        editor.feed(b"\x1b[5~")
+        self.assertEqual(editor.text, "")
+        editor.feed(b"\x1b[200~pasted text\x1b[201~")
+        self.assertEqual(editor.text, "pasted text")
+
+    def test_lone_escape_interrupts_after_sequence_grace(self):
+        editor = veyra.TurnInputEditor()
+        editor.feed(b"\x1b", now=1.0)
+        self.assertFalse(editor.expire_escape(now=1.01))
+        self.assertTrue(editor.expire_escape(now=2.0))
+        self.assertFalse(editor.escape_pending)
+
+    def test_ctrl_c_is_a_turn_interrupt_in_cbreak_input(self):
+        editor = veyra.TurnInputEditor()
+        self.assertEqual(editor.feed(b"\x03"), {"interrupt"})
+
+    @unittest.skipIf(veyra.termios is None, "POSIX terminal support unavailable")
+    def test_turn_terminal_input_restores_the_original_terminal_mode(self):
+        master_fd, slave_fd = pty.openpty()
+        stream = os.fdopen(os.dup(slave_fd), "r", encoding="utf-8")
+        original = veyra.termios.tcgetattr(slave_fd)
+        terminal = veyra.TurnTerminalInput(stream)
+        try:
+            terminal.resume()
+            active = veyra.termios.tcgetattr(slave_fd)
+            self.assertFalse(active[3] & veyra.termios.ECHO)
+            self.assertFalse(active[3] & veyra.termios.ICANON)
+            os.write(master_fd, b"x")
+            self.assertEqual(terminal.read_ready(), b"x")
+            terminal.pause()
+            restored = veyra.termios.tcgetattr(slave_fd)
+            self.assertEqual(restored[3] & veyra.termios.ECHO, original[3] & veyra.termios.ECHO)
+            self.assertEqual(
+                restored[3] & veyra.termios.ICANON,
+                original[3] & veyra.termios.ICANON,
+            )
+        finally:
+            terminal.pause()
+            stream.close()
+            os.close(master_fd)
+            os.close(slave_fd)
 
 
 class AppServerEventRoutingTests(unittest.TestCase):
@@ -695,6 +764,50 @@ class RoutedWorkerServer(FakeServer):
         raise AssertionError(f"unexpected method: {method}")
 
 
+class ScriptedTurnTerminal:
+    def __init__(self, data=b""):
+        self.data = data
+        self.enabled = True
+
+    def resume(self):
+        pass
+
+    def pause(self):
+        pass
+
+    def read_ready(self):
+        data, self.data = self.data, b""
+        return data
+
+
+class InterruptingTurnTerminal(ScriptedTurnTerminal):
+    def __init__(self, _stream):
+        super().__init__(b"\x03")
+
+
+class InterruptTurnServer(FakeServer):
+    def __init__(self):
+        super().__init__()
+        self.events = queue.Queue()
+
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "turn/start":
+            return {"turn": {"id": "turn"}}
+        if method == "turn/interrupt":
+            self.events.put(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": params["threadId"],
+                        "turn": {"id": params["turnId"], "status": "interrupted"},
+                    },
+                }
+            )
+            return {}
+        return {"thread": {"id": "thread"}}
+
+
 class ForkTests(unittest.TestCase):
     def test_user_prompt_starts_generic(self):
         catalogue = self.catalogue_with_luna()
@@ -786,6 +899,160 @@ class ForkTests(unittest.TestCase):
         )
         self.assertEqual(client.user_prompt, "user> ")
         self.assertFalse(server.calls[-1][1]["result"]["success"])
+
+    def test_clipboard_secret_tools_are_explicit_and_model_blind(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        tools = {tool["name"]: tool for tool in client.dynamic_tools()}
+        self.assertIn(veyra.BORROW_CLIPBOARD_SECRET_TOOL, tools)
+        self.assertIn(veyra.RETAIN_CLIPBOARD_SECRET_TOOL, tools)
+        self.assertIn("never returns the value", tools[
+            veyra.BORROW_CLIPBOARD_SECRET_TOOL
+        ]["description"])
+        self.assertIn("Never invoke either tool", client.developer_instructions)
+
+    def test_borrowed_clipboard_secret_is_a_one_read_fifo(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        secret_value = b"123456"
+        with tempfile.TemporaryDirectory() as directory:
+            client = veyra.VeyraClient(
+                server, catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("terra"), "medium", veyra.Palette(False),
+                secret_handoff_root=Path(directory),
+            )
+            with (
+                patch.object(client, "_read_interactive_response", return_value="y"),
+                patch.object(client, "_read_system_clipboard", return_value=secret_value),
+                patch.object(
+                    client,
+                    "_clear_system_clipboard_if_unchanged",
+                    return_value=True,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                client._handle_borrow_clipboard_secret(
+                    31,
+                    {"kind": "TOTP", "purpose": "Atlassian sign-in", "expires_in_seconds": 30},
+                )
+            response = server.calls[-1][1]["result"]
+            self.assertTrue(response["success"])
+            receipt_text = response["contentItems"][0]["text"]
+            self.assertNotIn(secret_value.decode(), receipt_text)
+            receipt = json.loads(receipt_text)
+            fifo = Path(receipt["path"])
+            self.assertTrue(stat.S_ISFIFO(fifo.stat().st_mode))
+            self.assertEqual(fifo.read_bytes(), secret_value)
+            handoff = next(iter(client._secret_handoffs.values()), None)
+            if handoff is not None and handoff.thread is not None:
+                handoff.thread.join(timeout=1)
+            self.assertFalse(fifo.exists())
+
+    def test_declined_clipboard_handoff_never_reads_clipboard(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        with (
+            patch.object(client, "_read_interactive_response", return_value="n"),
+            patch.object(client, "_read_system_clipboard") as read_clipboard,
+            redirect_stdout(io.StringIO()),
+        ):
+            client._handle_borrow_clipboard_secret(
+                32, {"kind": "TOTP", "purpose": "Atlassian sign-in"}
+            )
+        read_clipboard.assert_not_called()
+        self.assertFalse(server.calls[-1][1]["result"]["success"])
+
+    def test_unread_clipboard_handoff_expires_and_zeroes_memory(self):
+        catalogue = self.catalogue_with_luna()
+        with tempfile.TemporaryDirectory() as directory:
+            client = veyra.VeyraClient(
+                FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("terra"), "medium", veyra.Palette(False),
+                secret_handoff_root=Path(directory),
+            )
+            handoff = client._create_secret_handoff(b"ephemeral", expires_in=0.01)
+            assert handoff.thread is not None
+            handoff.thread.join(timeout=1)
+            self.assertFalse(handoff.path.exists())
+            self.assertEqual(handoff.value, bytearray(len(b"ephemeral")))
+            self.assertNotIn(handoff.handoff_id, client._secret_handoffs)
+
+    def test_changed_clipboard_is_not_cleared_or_lost(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        with tempfile.TemporaryDirectory() as directory:
+            client = veyra.VeyraClient(
+                server, catalogue, doctrine_bundle(), Path.cwd(),
+                catalogue.resolve("terra"), "medium", veyra.Palette(False),
+                secret_handoff_root=Path(directory),
+            )
+            with (
+                patch.object(client, "_read_interactive_response", return_value="y"),
+                patch.object(client, "_read_system_clipboard", return_value=b"first"),
+                patch.object(
+                    client,
+                    "_clear_system_clipboard_if_unchanged",
+                    return_value=False,
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                client._handle_borrow_clipboard_secret(
+                    34, {"kind": "token", "purpose": "One test request"}
+                )
+            receipt = json.loads(
+                server.calls[-1][1]["result"]["contentItems"][0]["text"]
+            )
+            self.assertEqual(receipt["clipboard"], "changed; not cleared")
+            self.assertEqual(Path(receipt["path"]).read_bytes(), b"first")
+
+    def test_retained_clipboard_secret_goes_directly_to_vault(self):
+        catalogue = self.catalogue_with_luna()
+        server = FakeServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        secret_value = b"synthetic-api-key"
+        with (
+            patch.object(client, "_read_interactive_response", return_value="yes"),
+            patch.object(client, "_read_system_clipboard", return_value=secret_value),
+            patch.object(
+                client,
+                "_clear_system_clipboard_if_unchanged",
+                return_value=True,
+            ),
+            patch.object(
+                client,
+                "_store_secret_in_vault",
+                return_value="a" * 32,
+            ) as store,
+            redirect_stdout(io.StringIO()),
+        ):
+            client._handle_retain_clipboard_secret(
+                33,
+                {
+                    "name": "Atlassian API token",
+                    "owner": "Alice",
+                    "kind": "api-token",
+                    "purpose": "Read Confluence",
+                    "scope": "Selected example Confluence spaces",
+                    "authorisation": "Alice explicitly approved this token",
+                },
+            )
+        store.assert_called_once()
+        self.assertEqual(store.call_args.args[0], secret_value)
+        response = server.calls[-1][1]["result"]
+        self.assertTrue(response["success"])
+        receipt_text = response["contentItems"][0]["text"]
+        self.assertNotIn(secret_value.decode(), receipt_text)
+        self.assertEqual(json.loads(receipt_text)["vault_id"], "a" * 32)
 
     def test_constructor_rejects_plain_doctrine_text(self):
         catalogue = self.catalogue_with_luna()
@@ -1454,6 +1721,53 @@ class ForkTests(unittest.TestCase):
         client.turn_active = True
         with self.assertRaisesRegex(veyra.VeyraError, "active turn"):
             client.run_turn("overlap")
+
+    def test_ctrl_c_during_a_turn_requests_foreground_interrupt(self):
+        catalogue = self.catalogue_with_sol()
+        server = InterruptTurnServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "high", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        with (
+            patch.object(veyra, "TurnTerminalInput", InterruptingTurnTerminal),
+            patch.object(veyra, "TURN_INPUT_POLL_SECONDS", 0),
+            redirect_stdout(io.StringIO()),
+        ):
+            client.run_turn("long operation")
+        self.assertIn(
+            (
+                "turn/interrupt",
+                {"threadId": "thread", "turnId": "turn"},
+            ),
+            server.calls,
+        )
+
+    def test_enter_during_a_turn_queues_the_next_user_turn(self):
+        catalogue = self.catalogue_with_sol()
+        server = TurnServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "high", veyra.Palette(False)
+        )
+        client.thread_id = "thread"
+        client.thread_provider = "openai"
+        scripted = iter([b"queued correction\r", b""])
+
+        def terminal_factory(_stream):
+            return ScriptedTurnTerminal(next(scripted))
+
+        with (
+            patch.object(veyra, "TurnTerminalInput", side_effect=terminal_factory),
+            patch.object(veyra, "TURN_INPUT_POLL_SECONDS", 0),
+            redirect_stdout(io.StringIO()),
+        ):
+            client.run_turn("initial request")
+        turns = [params for method, params in server.calls if method == "turn/start"]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[1]["input"], [{"type": "text", "text": "queued correction"}])
 
     def test_rejects_local_model_as_veyra_host(self):
         catalogue = veyra.ModelCatalogue(
