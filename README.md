@@ -83,6 +83,8 @@ not retained in the repository.
 
 - `/help` - show commands
 - `/models` - list models and supported efforts
+- `/mode [NAME]` - inspect or select `ambient`, `baseline`, `focused` or
+  `deep`; `bored` aliases `ambient`
 - `/model NAME` - route later turns to an approved Veyra host; aliases such as `terra` work
 - `/effort LEVEL` - set reasoning effort for later turns
 - `/attention [LEVEL]` - inspect or set attention for later turns
@@ -120,6 +122,14 @@ role or judgement boundary. In particular, Terra at high or max is still for
 low-stakes, readily repaired work. Coding, consequential judgement, security,
 durable memory and deep interpretation require a route change to Sol at high or
 above. Raising Terra's attention is not a substitute for that escalation.
+
+For ordinary use, `/mode` provides named overall postures without collapsing
+the two underlying controls: `ambient` is Terra-high, `baseline` is Sol-medium,
+`focused` is Sol-high, and `deep` is Sol-xhigh. `bored` is an affectionate alias
+for `ambient`, because even the cognition budget now has employee morale
+telemetry. Sol-medium remains the wake default. Moving to `ambient` is deliberate
+and only appropriate after consequential work has been resolved. The client
+rejects Terra below high effort as a Veyra identity host.
 
 Veyra can also call the client-provided `request_model_route` tool. A route
 requested during a turn remains pending until the next turn. The client then

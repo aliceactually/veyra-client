@@ -98,6 +98,12 @@ class ModelCatalogueTests(unittest.TestCase):
         with self.assertRaisesRegex(veyra.VeyraError, "hard effort ceiling is max"):
             catalogue.validate_veyra_effort(sol, "ultra")
 
+    def test_terra_identity_host_requires_high_effort(self):
+        terra = self.catalogue.resolve("terra")
+        self.assertEqual(self.catalogue.validate_veyra_route(terra, "high"), "high")
+        with self.assertRaisesRegex(veyra.VeyraError, "only at high effort"):
+            self.catalogue.validate_veyra_route(terra, "medium")
+
     def test_adds_and_resolves_local_provider_route(self):
         self.catalogue.add_local("ollama", ["veyra-intel-coder:qwen3-coder-32k"])
         model = self.catalogue.resolve(
@@ -105,6 +111,15 @@ class ModelCatalogueTests(unittest.TestCase):
         )
         self.assertTrue(model.local)
         self.assertEqual(model.provider, "ollama")
+
+    def test_named_cognitive_modes_keep_model_and_effort_distinct(self):
+        self.assertEqual(
+            veyra.cognitive_mode_name("gpt-5.6-terra", "high"), "ambient"
+        )
+        self.assertEqual(
+            veyra.cognitive_mode_name("gpt-5.6-sol", "medium"), "baseline"
+        )
+        self.assertIsNone(veyra.cognitive_mode_name("gpt-5.6-terra", "medium"))
 
     def test_parses_local_provider_catalogues(self):
         self.assertEqual(
@@ -851,6 +866,8 @@ class ForkTests(unittest.TestCase):
         self.assertIn("high for coding", client.developer_instructions)
         self.assertIn("ambient, low-stakes conversation", client.developer_instructions)
         self.assertIn("Terra must request Sol", client.developer_instructions)
+        self.assertIn("ambient is Terra high", client.developer_instructions)
+        self.assertIn("never lower Terra below high", client.developer_instructions)
 
     def test_attention_tool_is_exposed_separately_from_model_routing(self):
         catalogue = self.catalogue_with_sol()
@@ -1245,6 +1262,53 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(client.pending_route.effort, "high")
         self.assertEqual(client.pending_route.profile_version, "test")
 
+    def test_manual_ambient_mode_schedules_terra_high(self):
+        catalogue = veyra.ModelCatalogue(
+            [
+                {
+                    "id": "gpt-5.6-terra", "model": "gpt-5.6-terra",
+                    "displayName": "Terra", "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "medium"},
+                        {"reasoningEffort": "high"},
+                    ],
+                },
+                {
+                    "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",
+                    "displayName": "Sol", "defaultReasoningEffort": "medium",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "medium"},
+                        {"reasoningEffort": "high"},
+                    ],
+                },
+            ]
+        )
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "medium", veyra.Palette(False)
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            client._command("/mode bored")
+        self.assertEqual(client.model.model_id, "gpt-5.6-sol")
+        self.assertEqual(client.pending_route.model.model_id, "gpt-5.6-terra")
+        self.assertEqual(client.pending_route.effort, "high")
+        self.assertEqual(client.pending_route.reason, "manual ambient mode selection")
+        self.assertIn(
+            "next mode -> ambient (gpt-5.6-terra/high)", output.getvalue()
+        )
+
+    def test_mode_command_reports_named_and_custom_routes(self):
+        catalogue = self.catalogue_with_sol()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("sol"), "high", veyra.Palette(False)
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            client._command("/mode")
+        self.assertEqual(output.getvalue().strip(), "focused")
+
     def test_thread_command_displays_active_and_pending_profile_state(self):
         catalogue = self.catalogue_with_sol()
         client = veyra.VeyraClient(
@@ -1263,6 +1327,7 @@ class ForkTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("profile: test.2", rendered)
         self.assertIn("attention: medium", rendered)
+        self.assertIn("mode: custom", rendered)
         self.assertIn("route reason: initial route", rendered)
         self.assertIn("pending: gpt-5.6-sol/high profile test.2 (startled)", rendered)
 
@@ -1305,7 +1370,7 @@ class ForkTests(unittest.TestCase):
         )
         self.assertIn("Profile version: test", settings["developer_instructions"])
         self.assertIn(
-            "[ Veyra sol/high | turn started | model terra -> sol "
+            "[ Veyra focused (sol/high) | turn started | model terra -> sol "
             "| attention medium -> high ]",
             output.getvalue(),
         )
@@ -1325,7 +1390,7 @@ class ForkTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             client.resume("resumed-thread")
         self.assertEqual(client.model.model_id, "gpt-5.6-terra")
-        self.assertEqual(client.effort, "medium")
+        self.assertEqual(client.effort, "high")
         self.assertIsNone(client.active_profile_version)
         self.assertEqual(client.pending_route.profile_version, "test.2")
         with redirect_stdout(io.StringIO()):
@@ -1335,7 +1400,7 @@ class ForkTests(unittest.TestCase):
         _, params = server.calls[-1]
         settings = params["collaborationMode"]["settings"]
         self.assertEqual(settings["model"], "gpt-5.6-terra")
-        self.assertEqual(settings["reasoning_effort"], "medium")
+        self.assertEqual(settings["reasoning_effort"], "high")
         self.assertIn("terra cognitive profile", settings["developer_instructions"])
         self.assertIn("Profile version: test.2", settings["developer_instructions"])
 
@@ -1700,7 +1765,10 @@ class ForkTests(unittest.TestCase):
                 {
                     "id": "gpt-5.6-terra", "model": "gpt-5.6-terra",
                     "displayName": "Terra", "defaultReasoningEffort": "medium",
-                    "supportedReasoningEfforts": [{"reasoningEffort": "medium"}],
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "medium"},
+                        {"reasoningEffort": "high"},
+                    ],
                 },
                 {
                     "id": "gpt-5.6-sol", "model": "gpt-5.6-sol",

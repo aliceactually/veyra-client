@@ -34,6 +34,17 @@ from typing import Any
 CLIENT_VERSION = "0.9.0"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
+COGNITIVE_MODES = {
+    "ambient": ("gpt-5.6-terra", "high"),
+    "baseline": ("gpt-5.6-sol", "medium"),
+    "focused": ("gpt-5.6-sol", "high"),
+    "deep": ("gpt-5.6-sol", "xhigh"),
+}
+COGNITIVE_MODE_ALIASES = {
+    "bored": "ambient",
+    "normal": "baseline",
+    "focus": "focused",
+}
 APPROVAL_POLICY = "on-request"
 DEFAULT_APPROVALS_REVIEWER = "auto_review"
 SANDBOX_MODE = "workspace-write"
@@ -106,6 +117,14 @@ def readline_safe_prompt(prompt: str) -> str:
         ),
         prompt,
     )
+
+
+def cognitive_mode_name(model_id: str, effort: str) -> str | None:
+    """Return the named overall posture for an exact model/effort pair."""
+    for name, route in COGNITIVE_MODES.items():
+        if route == (model_id, effort):
+            return name
+    return None
 
 
 def _libedit_prompt_placeholder(prompt: str) -> str | None:
@@ -551,6 +570,16 @@ class ModelCatalogue:
             raise VeyraError(
                 f"Veyra's hard effort ceiling is {MAX_VEYRA_EFFORT}: {value} rejected"
             )
+        return value
+
+    def validate_veyra_route(self, model: Model, effort: str) -> str:
+        """Validate effort plus the minimum cognition for an identity host."""
+        value = self.validate_veyra_effort(model, effort)
+        if (
+            model.model_id == "gpt-5.6-terra"
+            and REASONING_EFFORT_RANK[value] < REASONING_EFFORT_RANK["high"]
+        ):
+            raise VeyraError("Terra may host Veyra only at high effort or above")
         return value
 
 
@@ -1060,18 +1089,19 @@ class VeyraClient:
             + f"Profile version: {version}\n"
             + "\n\n# Harness routing\n\n"
             + "You are running inside Veyra Client. Normal attention is Sol at "
-            + "medium effort. Use the client tool "
+            + "medium effort, the named baseline mode. Use the client tool "
             + f"`{ATTENTION_TOOL}` when a later turn warrants a different reasoning "
-            + "effort without changing model. Use low for simple, readily repaired "
-            + "conversation; medium for ordinary focused work; high for coding, "
+            + "effort without changing model. Use high for coding, "
             + "consequential judgement, durable memory and deep interpretation; and "
             + "xhigh only for unusually difficult or consequential work. Max requires "
             + "Alice's explicit permission for that use: recommend it and ask when it "
             + "would materially help, then select it yourself after she agrees. Never "
             + "exceed max; the client hard-rejects higher or unclassified efforts. "
             + "Avoid oscillating between levels, give a concise "
-            + "reason for every shift, and return towards medium after the deeper work "
-            + "is resolved. If a request unexpectedly exceeds the active attention, "
+            + "reason for every shift, and return towards baseline or ambient after "
+            + "the deeper work is resolved. Ambient is Terra at high effort; never "
+            + "lower Terra below high. If a request unexpectedly exceeds the active "
+            + "attention, "
             + "schedule the required level with `continue_task` set to true and defer "
             + "consequential execution until the automatically initiated next turn. "
             + "Alice has authorised this single bounded continuation, so never ask her "
@@ -1085,7 +1115,11 @@ class VeyraClient:
             + "consequential judgement, durable memory and deep human-interface "
             + "work. Terra is Veyra's lighter profile for ambient, low-stakes "
             + "conversation and trivial non-coding work. Terra must request Sol "
-            + "when stakes, ambiguity or scope rise. "
+            + "when stakes, ambiguity or scope rise. Named cognitive modes keep "
+            + "model and effort distinct: ambient is Terra high, baseline is Sol "
+            + "medium, focused is Sol high, and deep is Sol xhigh. Sol medium remains "
+            + "the wake default. Only settle to ambient after consequential work is "
+            + "resolved; use the model-route tool for that transition. "
             + "An explicit request to commit or checkpoint "
             + "code together with continuity or memories is consequential by default: "
             + "use Sol high or above for the committing turn. Give a concise reason. "
@@ -1117,7 +1151,8 @@ class VeyraClient:
                     "Veyra may only use gpt-5.6-terra or gpt-5.6-sol. Use Sol for "
                     "coding, consequential judgement, durable memory and deep "
                     "interpretation; Terra is for ambient low-stakes conversation "
-                    "and trivial non-coding work. Max requires Alice's explicit "
+                    "and trivial non-coding work; Veyra's named ambient mode is "
+                    "Terra at high effort. Max requires Alice's explicit "
                     "permission for that use; efforts above max are prohibited."
                 ),
                 "inputSchema": {
@@ -1153,11 +1188,11 @@ class VeyraClient:
                 "name": ATTENTION_TOOL,
                 "description": (
                     "Request a reasoning-effort change for subsequent turns without "
-                    "changing Veyra's selected model. Normal attention is medium; use "
-                    "high or xhigh when depth or consequence genuinely warrants it, "
-                    "and settle back towards medium afterwards. Max requires Alice's "
-                    "explicit permission for that use; efforts above max are "
-                    "prohibited."
+                    "changing Veyra's selected model. Baseline is Sol medium and "
+                    "ambient is Terra high; never lower Terra below high. Use high or "
+                    "xhigh when depth or consequence genuinely warrants it. Max "
+                    "requires Alice's explicit permission for that use; efforts "
+                    "above max are prohibited."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1351,7 +1386,7 @@ class VeyraClient:
         requested_effort = effort or self.effort
         if effort is None and target.efforts and requested_effort not in target.efforts:
             requested_effort = target.default_effort
-        target_effort = self.catalogue.validate_veyra_effort(
+        target_effort = self.catalogue.validate_veyra_route(
             target, requested_effort
         )
         previous_thread = self.thread_id
@@ -1422,8 +1457,17 @@ class VeyraClient:
             "reasoningEffort"
         )
         if reported_effort:
-            self.effort = self.catalogue.validate_veyra_effort(
+            resumed_effort = self.catalogue.validate_veyra_effort(
                 self.model, reported_effort
+            )
+            if (
+                self.model.model_id == "gpt-5.6-terra"
+                and REASONING_EFFORT_RANK[resumed_effort]
+                < REASONING_EFFORT_RANK["high"]
+            ):
+                resumed_effort = "high"
+            self.effort = self.catalogue.validate_veyra_route(
+                self.model, resumed_effort
             )
         self.active_profile_version = None
         self.active_route_reason = "resumed thread; profile requires reconciliation"
@@ -1818,7 +1862,7 @@ class VeyraClient:
 
     def _schedule_route(self, target: Model, effort: str, reason: str) -> None:
         self._require_veyra_host(target)
-        validated = self.catalogue.validate_veyra_effort(target, effort)
+        validated = self.catalogue.validate_veyra_route(target, effort)
         self.pending_route = PendingRoute(
             target, validated, reason, self.doctrine.version
         )
@@ -2350,6 +2394,7 @@ class VeyraClient:
         if command == "/help":
             print(
                 "/models               available routes\n"
+                "/mode [NAME]          inspect or set cognitive mode\n"
                 "/model NAME            set model for later turns\n"
                 "/effort LEVEL          set reasoning effort\n"
                 "/attention [LEVEL]     inspect or set attention\n"
@@ -2377,6 +2422,37 @@ class VeyraClient:
                 efforts = ", ".join(model.efforts) or "provider-defined"
                 location = "worker-only" if model.local else "Veyra host"
                 print(f"{marker} {model.route_id}: {efforts} [{location}]")
+        elif command == "/mode":
+            if not args:
+                target = (
+                    self.pending_route.model if self.pending_route else self.model
+                )
+                effort = (
+                    self.pending_route.effort if self.pending_route else self.effort
+                )
+                mode = cognitive_mode_name(target.model_id, effort)
+                print(mode or f"custom ({target.route_id}/{effort})")
+            elif len(args) == 1:
+                requested = args[0].lower()
+                mode = COGNITIVE_MODE_ALIASES.get(requested, requested)
+                try:
+                    model_id, effort = COGNITIVE_MODES[mode]
+                except KeyError as exc:
+                    choices = ", ".join(COGNITIVE_MODES)
+                    raise VeyraError(
+                        f"unknown cognitive mode: {requested}; use {choices}"
+                    ) from exc
+                target = self.catalogue.resolve(model_id)
+                self._require_veyra_host(target)
+                effort = self.catalogue.validate_veyra_effort(target, effort)
+                self._schedule_route(target, effort, f"manual {mode} mode selection")
+                print(
+                    self.palette.dim(
+                        f"next mode -> {mode} ({target.route_id}/{effort})"
+                    )
+                )
+            else:
+                raise VeyraError("usage: /mode [ambient|baseline|focused|deep]")
         elif command == "/model":
             if not args:
                 selected = self.pending_route.model if self.pending_route else self.model
@@ -2487,6 +2563,10 @@ class VeyraClient:
             print(f"thread: {self.thread_id}")
             print(f"cwd: {self.cwd}")
             print(f"route: {self.model.route_id}/{self.effort}")
+            print(
+                "mode: "
+                + (cognitive_mode_name(self.model.model_id, self.effort) or "custom")
+            )
             print(f"attention: {self.effort}")
             print(f"profile: {self.active_profile_version or 'unverified'}")
             print(f"route reason: {self.active_route_reason}")
@@ -2533,12 +2613,18 @@ class VeyraClient:
         last = self.latest_usage.get("last") or {}
         total = self.latest_usage.get("total") or {}
         model = self.model.model_id.removeprefix("gpt-5.6-")
+        mode = cognitive_mode_name(self.model.model_id, self.effort)
+        posture = (
+            f"{mode} ({model}/{self.effort})"
+            if mode
+            else f"{model}/{self.effort}"
+        )
         last_total = format_tokens(last.get("totalTokens"))
         thread_total = format_tokens(total.get("totalTokens"))
         gauge = token_gauge(last)
         self._render_status_bar(
             "[ "
-            f"Veyra {model}/{self.effort} | turn {last_total} "
+            f"Veyra {posture} | turn {last_total} "
             f"I {format_tokens(last.get('inputTokens'))} "
             f"C {format_tokens(last.get('cachedInputTokens'))} "
             f"O {format_tokens(last.get('outputTokens'))} "
@@ -2555,7 +2641,13 @@ class VeyraClient:
         """Show the accepted route as soon as a turn becomes active."""
         model = self.model.model_id.removeprefix("gpt-5.6-")
         previous = previous_model.model_id.removeprefix("gpt-5.6-")
-        parts = [f"Veyra {model}/{self.effort}", "turn started"]
+        mode = cognitive_mode_name(self.model.model_id, self.effort)
+        posture = (
+            f"{mode} ({model}/{self.effort})"
+            if mode
+            else f"{model}/{self.effort}"
+        )
+        parts = [f"Veyra {posture}", "turn started"]
         if previous_model.route_id != self.model.route_id:
             parts.append(f"model {previous} -> {model}")
         if previous_effort != self.effort:
@@ -2783,7 +2875,7 @@ def main(argv: list[str] | None = None) -> int:
             for provider, model_ids in local.items():
                 catalogue.add_local(provider, model_ids)
         model = catalogue.resolve(args.model)
-        effort = catalogue.validate_effort(model, args.effort)
+        effort = catalogue.validate_veyra_route(model, args.effort)
         client = VeyraClient(
             server,
             catalogue,
