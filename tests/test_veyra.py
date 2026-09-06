@@ -808,6 +808,56 @@ class InterruptTurnServer(FakeServer):
         return {"thread": {"id": "thread"}}
 
 
+class CollabStateServer(FakeServer):
+    agent_id = "01999999-aaaa-bbbb-cccc-1234deadbeef"
+
+    def request(self, method, params):
+        self.calls.append((method, params))
+        if method == "thread/list":
+            return {
+                "data": [
+                    {
+                        "id": self.agent_id,
+                        "parentThreadId": "root-thread",
+                        "agentNickname": "Zeno",
+                        "model": "gpt-5.6-sol",
+                        "reasoningEffort": "high",
+                        "preview": "Scout detector models",
+                        "source": {
+                            "subAgent": {
+                                "thread_spawn": {
+                                    "agent_path": "/root/detector_scout",
+                                    "depth": 1,
+                                    "parent_thread_id": "root-thread",
+                                }
+                            }
+                        },
+                        "status": {"type": "idle"},
+                    }
+                ],
+                "nextCursor": None,
+            }
+        if method == "thread/items/list":
+            if params["threadId"] == "root-thread":
+                return {
+                    "data": [
+                        {
+                            "turnId": "turn-1",
+                            "item": {
+                                "type": "subAgentActivity",
+                                "id": "item-1",
+                                "kind": "completed",
+                                "agentThreadId": self.agent_id,
+                                "agentPath": "/root/detector_scout",
+                            },
+                        }
+                    ],
+                    "nextCursor": None,
+                }
+            return {"data": [], "nextCursor": None}
+        return {"thread": {"id": "thread"}}
+
+
 class ForkTests(unittest.TestCase):
     def test_user_prompt_starts_generic(self):
         catalogue = self.catalogue_with_luna()
@@ -2031,6 +2081,75 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(params["threadId"], "worker-thread")
         self.assertEqual(params["turnId"], "worker-turn")
         self.assertEqual(job.status, "cancelled")
+
+    def test_jobs_hydrates_native_collaboration_agents(self):
+        catalogue = self.catalogue_with_luna()
+        server = CollabStateServer()
+        client = veyra.VeyraClient(
+            server, catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "root-thread"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            client._show_worker_jobs()
+        text = output.getvalue()
+        self.assertIn("Collaboration agents:", text)
+        self.assertIn("agent-deadbeef  completed  Zeno", text)
+        self.assertEqual(len(client.collab_jobs), 1)
+        list_call = next(call for call in server.calls if call[0] == "thread/list")
+        self.assertEqual(list_call[1]["ancestorThreadId"], "root-thread")
+        self.assertIn("subAgentThreadSpawn", list_call[1]["sourceKinds"])
+
+    def test_job_inspects_a_persisted_collaboration_agent(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            CollabStateServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "root-thread"
+        output = io.StringIO()
+        with redirect_stdout(output):
+            client._show_worker_job("agent-deadbeef")
+        text = output.getvalue()
+        self.assertIn("completed on gpt-5.6-sol/high (collaboration agent)", text)
+        self.assertIn("identity: Zeno", text)
+        self.assertIn("task: Scout detector models", text)
+
+    def test_current_collaboration_item_type_updates_live_agent_state(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            FakeServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "root-thread"
+        item = {
+            "type": "collabAgentToolCall",
+            "tool": "spawnAgent",
+            "senderThreadId": "root-thread",
+            "receiverThreadIds": [CollabStateServer.agent_id],
+            "agentsStates": {
+                CollabStateServer.agent_id: {"status": "running"}
+            },
+            "prompt": "Scout detectors",
+        }
+        with redirect_stdout(io.StringIO()):
+            client._show_item_started(item)
+        agent = client.collab_jobs[CollabStateServer.agent_id]
+        self.assertEqual(agent.status, "running")
+        self.assertEqual(agent.prompt, "Scout detectors")
+
+    def test_cancel_job_explains_native_agent_control_boundary(self):
+        catalogue = self.catalogue_with_luna()
+        client = veyra.VeyraClient(
+            CollabStateServer(), catalogue, doctrine_bundle(), Path.cwd(),
+            catalogue.resolve("terra"), "medium", veyra.Palette(False)
+        )
+        client.thread_id = "root-thread"
+        with self.assertRaisesRegex(
+            veyra.VeyraError, "ask Veyra to interrupt that agent"
+        ):
+            client._cancel_worker_job("agent-deadbeef")
 
     def test_route_tool_rejects_worker_only_hosted_model(self):
         catalogue = self.catalogue_with_luna()

@@ -113,9 +113,10 @@ Veyra's authorisation boundary.
 - `/local MODEL PROMPT` - run a bounded local worker directly
 - `/worker MODEL PROMPT` - run a bounded task on any worker-only route
 - `/bgworker MODEL PROMPT` - start a read-only worker and return to the prompt
-- `/jobs` - list background worker jobs
-- `/job ID` - inspect one background worker and its report
-- `/cancel-job ID` - interrupt a background worker
+- `/jobs` - list detached workers and native collaboration agents
+- `/job ID` - inspect one detached worker or collaboration agent
+- `/cancel-job ID` - interrupt a detached worker; ask Veyra to interrupt a
+  native collaboration agent
 - `/branch [MODEL] [EFFORT]` - branch the current history and enter that branch
 - `/new` - start an empty thread
 - `/threads` - list recent threads
@@ -181,7 +182,9 @@ fabricated user message. If a report arrives during a turn, Veyra handles it
 immediately after that turn. If Alice is composing input, the status row shows
 that a report is ready and the client waits until Enter before collecting it,
 preserving the active Readline buffer. `/jobs` and `/job ID` expose the same
-state directly. Jobs are session-scoped; exiting the client stops unfinished
+state directly. They also discover Codex collaboration agents from the active
+thread's persisted subagent tree and label those separately from detached
+workers. Detached jobs are session-scoped; exiting the client stops unfinished
 workers. Reports remain attached to the Veyra thread that launched them, so
 switching threads does not inject an old report into unrelated context.
 

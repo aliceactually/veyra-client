@@ -41,7 +41,7 @@ from types import MappingProxyType
 from typing import Any
 
 
-CLIENT_VERSION = "0.10.0"
+CLIENT_VERSION = "0.10.1"
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EFFORT = "medium"
 COGNITIVE_MODES = {
@@ -94,6 +94,20 @@ SPAWN_WORKER_AGENT_TOOL = "spawn_worker_agent"
 BACKGROUND_WORKER_RESULT_TOOL = "background_worker_result"
 ROUTE_CONTINUATION_TOOL = "route_change_continuation"
 MAX_BACKGROUND_WORKERS = 3
+COLLAB_ITEM_TYPES = frozenset({"collabAgentToolCall", "collabToolCall"})
+SUBAGENT_ACTIVITY_ITEM_TYPE = "subAgentActivity"
+COLLAB_TRACKED_ITEM_TYPES = COLLAB_ITEM_TYPES | {SUBAGENT_ACTIVITY_ITEM_TYPE}
+COLLAB_ACTIVE_STATUSES = frozenset({"pendingInit", "running"})
+COLLAB_TERMINAL_STATUSES = frozenset(
+    {"interrupted", "completed", "errored", "shutdown", "notFound"}
+)
+COLLAB_SOURCE_KINDS = (
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+)
 TURN_INPUT_POLL_SECONDS = 0.05
 TURN_ESCAPE_GRACE_SECONDS = 0.04
 PROMPT_COLOURS = {
@@ -668,6 +682,25 @@ class WorkerJob:
 
 
 @dataclass
+class CollabJob:
+    thread_id: str
+    root_thread_id: str
+    parent_thread_id: str | None = None
+    status: str = "unknown"
+    runtime_status: str | None = None
+    prompt: str | None = None
+    nickname: str | None = None
+    role: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    message: str | None = None
+
+    @property
+    def job_id(self) -> str:
+        return f"agent-{self.thread_id[-8:]}"
+
+
+@dataclass
 class SecretHandoff:
     handoff_id: str
     directory: Path
@@ -1155,6 +1188,8 @@ class VeyraClient:
         self.worker_jobs: dict[str, WorkerJob] = {}
         self._worker_jobs_lock = threading.Lock()
         self._next_worker_job = 1
+        self.collab_jobs: dict[str, CollabJob] = {}
+        self._collab_jobs_lock = threading.Lock()
         self.status_bar_enabled = palette.terminal
         self.status_bar_visible = False
         self.terminal_ui_active = False
@@ -1955,8 +1990,9 @@ class VeyraClient:
                     self._show_item_started(params.get("item") or {})
                 elif method == "item/completed":
                     item = params.get("item") or {}
-                    if item.get("type") == "collabToolCall":
-                        status = item.get("status") or "completed"
+                    if item.get("type") in COLLAB_TRACKED_ITEM_TYPES:
+                        self._track_collab_item(item)
+                        status = item.get("status") or item.get("kind") or "completed"
                         self._render_status_bar(
                             f"[ Veyra | background agent {status}"
                             + self._background_status_suffix()
@@ -1998,8 +2034,9 @@ class VeyraClient:
             paths = [change.get("path") for change in changes if change.get("path")]
             label = ", ".join(paths) if paths else "workspace files"
             print(self.palette.dim(f"\n[edit] {label}"))
-        elif item_type == "collabToolCall":
-            tool = item.get("tool") or "agent"
+        elif item_type in COLLAB_TRACKED_ITEM_TYPES:
+            self._track_collab_item(item)
+            tool = item.get("tool") or item.get("kind") or "agent"
             print(self.palette.dim(f"\n[agent] {tool}"))
 
     def _handle_server_request(self, message: dict[str, Any]) -> None:
@@ -2674,6 +2711,223 @@ class VeyraClient:
                 job.finished_at = time.monotonic()
         self._refresh_background_status()
 
+    def _track_collab_item(
+        self, item: dict[str, Any], *, root_thread_id: str | None = None
+    ) -> None:
+        """Merge one native collaboration event into the session job view."""
+        item_type = item.get("type")
+        if item_type not in COLLAB_TRACKED_ITEM_TYPES:
+            return
+        root_id = root_thread_id or self.thread_id
+        if not root_id:
+            return
+        if item_type == SUBAGENT_ACTIVITY_ITEM_TYPE:
+            thread_id = item.get("agentThreadId")
+            if (
+                not isinstance(thread_id, str)
+                or not thread_id
+                or thread_id == root_id
+            ):
+                return
+            kind = item.get("kind")
+            status = {
+                "started": "running",
+                "interacted": "running",
+                "interrupted": "interrupted",
+                "completed": "completed",
+            }.get(kind, str(kind) if kind else "unknown")
+            with self._collab_jobs_lock:
+                job = self.collab_jobs.get(thread_id)
+                if job is None:
+                    job = CollabJob(thread_id=thread_id, root_thread_id=root_id)
+                    self.collab_jobs[thread_id] = job
+                job.root_thread_id = root_id
+                job.status = status
+                if item.get("agentPath"):
+                    job.role = str(item["agentPath"])
+            return
+        states = item.get("agentsStates") or item.get("agents_states") or {}
+        receivers = (
+            item.get("receiverThreadIds")
+            or item.get("receiver_thread_ids")
+            or []
+        )
+        thread_ids = list(dict.fromkeys([*receivers, *states.keys()]))
+        parent_id = item.get("senderThreadId") or item.get("sender_thread_id")
+        spawn = item.get("tool") in {"spawnAgent", "spawn_agent"}
+        with self._collab_jobs_lock:
+            for thread_id in thread_ids:
+                if (
+                    not isinstance(thread_id, str)
+                    or not thread_id
+                    or thread_id == root_id
+                ):
+                    continue
+                job = self.collab_jobs.get(thread_id)
+                if job is None:
+                    job = CollabJob(
+                        thread_id=thread_id,
+                        root_thread_id=root_id,
+                        parent_thread_id=parent_id,
+                    )
+                    self.collab_jobs[thread_id] = job
+                else:
+                    job.root_thread_id = root_id
+                    if job.parent_thread_id is None:
+                        job.parent_thread_id = parent_id
+                state = states.get(thread_id) or {}
+                status = state.get("status")
+                if status:
+                    job.status = status
+                if state.get("message") is not None:
+                    job.message = str(state["message"])
+                if spawn:
+                    if item.get("prompt"):
+                        job.prompt = str(item["prompt"])
+                    if item.get("model"):
+                        job.model = str(item["model"])
+                    if item.get("reasoningEffort"):
+                        job.effort = str(item["reasoningEffort"])
+
+    @staticmethod
+    def _collab_thread_runtime_status(thread: dict[str, Any]) -> str | None:
+        status = thread.get("status")
+        if isinstance(status, dict):
+            value = status.get("type")
+            return str(value) if value else None
+        return str(status) if status else None
+
+    @staticmethod
+    def _collab_thread_path(thread: dict[str, Any]) -> str | None:
+        source = thread.get("source")
+        if not isinstance(source, dict):
+            return None
+        subagent = source.get("subAgent")
+        if not isinstance(subagent, dict):
+            return None
+        spawn = subagent.get("thread_spawn")
+        if not isinstance(spawn, dict):
+            return None
+        path = spawn.get("agent_path")
+        return str(path) if path else None
+
+    def _merge_collab_thread(
+        self, thread: dict[str, Any], *, root_thread_id: str
+    ) -> None:
+        thread_id = thread.get("id")
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        runtime_status = self._collab_thread_runtime_status(thread)
+        with self._collab_jobs_lock:
+            job = self.collab_jobs.get(thread_id)
+            if job is None:
+                job = CollabJob(thread_id=thread_id, root_thread_id=root_thread_id)
+                self.collab_jobs[thread_id] = job
+            job.root_thread_id = root_thread_id
+            job.parent_thread_id = thread.get("parentThreadId") or job.parent_thread_id
+            job.runtime_status = runtime_status
+            job.nickname = thread.get("agentNickname") or job.nickname
+            job.role = (
+                self._collab_thread_path(thread)
+                or thread.get("agentRole")
+                or thread.get("name")
+                or job.role
+            )
+            job.model = thread.get("model") or job.model
+            effort = thread.get("reasoningEffort")
+            if effort:
+                job.effort = str(effort)
+            if not job.prompt and thread.get("preview"):
+                job.prompt = str(thread["preview"])
+            if runtime_status == "active":
+                job.status = "running"
+            elif (
+                runtime_status == "systemError"
+                and job.status not in COLLAB_TERMINAL_STATUSES
+            ):
+                job.status = "errored"
+            elif job.status == "unknown" and runtime_status:
+                job.status = runtime_status
+
+    def _refresh_collab_jobs_from_server(self) -> list[str]:
+        """Hydrate native collaboration jobs from persisted App Server state."""
+        root_id = self.thread_id
+        if not root_id:
+            return []
+        warnings: list[str] = []
+        descendants: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        try:
+            while True:
+                params: dict[str, Any] = {
+                    "ancestorThreadId": root_id,
+                    "limit": 100,
+                    "sortKey": "created_at",
+                    "sortDirection": "asc",
+                    "sourceKinds": list(COLLAB_SOURCE_KINDS),
+                }
+                if cursor:
+                    params["cursor"] = cursor
+                result = self.server.request("thread/list", params) or {}
+                descendants.extend(result.get("data") or [])
+                next_cursor = result.get("nextCursor")
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                seen_cursors.add(next_cursor)
+                cursor = next_cursor
+        except VeyraError as exc:
+            warnings.append(f"could not list collaboration threads: {exc}")
+
+        for thread in descendants:
+            if isinstance(thread, dict):
+                self._merge_collab_thread(thread, root_thread_id=root_id)
+
+        parent_ids = [root_id]
+        parent_ids.extend(
+            thread["parentThreadId"]
+            for thread in descendants
+            if isinstance(thread, dict)
+            and isinstance(thread.get("parentThreadId"), str)
+        )
+        for parent_id in dict.fromkeys(parent_ids):
+            cursor = None
+            seen_cursors = set()
+            try:
+                while True:
+                    params = {
+                        "threadId": parent_id,
+                        "limit": 100,
+                        "sortDirection": "asc",
+                    }
+                    if cursor:
+                        params["cursor"] = cursor
+                    result = self.server.request("thread/items/list", params) or {}
+                    for entry in result.get("data") or []:
+                        if not isinstance(entry, dict):
+                            continue
+                        item = entry.get("item") or entry
+                        if isinstance(item, dict):
+                            self._track_collab_item(item, root_thread_id=root_id)
+                    next_cursor = result.get("nextCursor")
+                    if not next_cursor or next_cursor in seen_cursors:
+                        break
+                    seen_cursors.add(next_cursor)
+                    cursor = next_cursor
+            except VeyraError as exc:
+                warnings.append(
+                    f"could not read collaboration state for {parent_id}: {exc}"
+                )
+        # Runtime activity is the freshest signal when an agent is still working;
+        # persisted lifecycle entries remain authoritative for terminal states.
+        for thread in descendants:
+            if (
+                isinstance(thread, dict)
+                and self._collab_thread_runtime_status(thread) == "active"
+            ):
+                self._merge_collab_thread(thread, root_thread_id=root_id)
+        return warnings
+
     def _refresh_background_status(self) -> None:
         if not self.terminal_ui_active:
             return
@@ -2688,9 +2942,19 @@ class VeyraClient:
                 and job.parent_thread_id in {None, self.thread_id}
                 for job in self.worker_jobs.values()
             )
+        with self._collab_jobs_lock:
+            agents_running = sum(
+                job.root_thread_id == self.thread_id
+                and job.status in COLLAB_ACTIVE_STATUSES
+                for job in self.collab_jobs.values()
+            )
         parts = []
         if running:
             parts.append(f"{running} worker{'s' if running != 1 else ''} running")
+        if agents_running:
+            parts.append(
+                f"{agents_running} agent{'s' if agents_running != 1 else ''} running"
+            )
         if ready:
             parts.append(
                 f"{ready} report{'s' if ready != 1 else ''} ready - Enter to collect"
@@ -2711,38 +2975,112 @@ class VeyraClient:
             ]
 
     def _show_worker_jobs(self) -> None:
+        warnings = self._refresh_collab_jobs_from_server()
         with self._worker_jobs_lock:
             jobs = list(self.worker_jobs.values())
-        if not jobs:
-            print("No background worker jobs.")
+        with self._collab_jobs_lock:
+            agents = [
+                job
+                for job in self.collab_jobs.values()
+                if job.root_thread_id == self.thread_id
+            ]
+        if not jobs and not agents:
+            print("No detached worker jobs or collaboration agents.")
+            for warning in warnings:
+                print(self.palette.warning(f"warning: {warning}"), file=sys.stderr)
             return
-        for job in jobs:
-            delivery = "delivered" if job.delivered else "pending delivery"
-            print(
-                f"{job.job_id}  {job.status}  {job.target.route_id}/{job.effort}  "
-                f"{delivery}  parent={job.parent_thread_id or 'next thread'}"
-            )
+
+        if jobs:
+            print("Detached workers:")
+            for job in jobs:
+                delivery = "delivered" if job.delivered else "pending delivery"
+                print(
+                    f"  {job.job_id}  {job.status}  "
+                    f"{job.target.route_id}/{job.effort}  {delivery}  "
+                    f"parent={job.parent_thread_id or 'next thread'}"
+                )
+        if agents:
+            print("Collaboration agents:")
+            for job in sorted(agents, key=lambda value: value.job_id):
+                identity = self._collab_identity(job)
+                route = job.model or "unknown model"
+                if job.effort:
+                    route += f"/{job.effort}"
+                print(f"  {job.job_id}  {job.status}  {identity}  {route}")
+        for warning in warnings:
+            print(self.palette.warning(f"warning: {warning}"), file=sys.stderr)
+
+    def _find_collab_job(self, job_id: str) -> CollabJob | None:
+        wanted = job_id.casefold()
+        with self._collab_jobs_lock:
+            matches = [
+                job
+                for job in self.collab_jobs.values()
+                if job.root_thread_id == self.thread_id
+                and wanted
+                in {
+                    job.job_id.casefold(),
+                    job.thread_id.casefold(),
+                    (job.nickname or "").casefold(),
+                    (job.role or "").casefold(),
+                }
+            ]
+        if len(matches) > 1:
+            raise VeyraError(f"ambiguous collaboration agent: {job_id}")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def _collab_identity(job: CollabJob) -> str:
+        if job.nickname and job.role:
+            return f"{job.nickname} ({job.role})"
+        return job.nickname or job.role or "unnamed"
 
     def _show_worker_job(self, job_id: str) -> None:
         with self._worker_jobs_lock:
             job = self.worker_jobs.get(job_id)
-            if job is None:
-                raise VeyraError(f"unknown background worker job: {job_id}")
-            status = job.status
-            target = job.target.route_id
-            effort = job.effort
-            prompt = job.prompt
-            result = job.report if job.report is not None else job.error
-        print(f"{job_id}: {status} on {target}/{effort}")
-        print(f"task: {prompt}")
-        if result:
-            print(result)
+            if job is not None:
+                status = job.status
+                target = job.target.route_id
+                effort = job.effort
+                prompt = job.prompt
+                result = job.report if job.report is not None else job.error
+        if job is not None:
+            print(f"{job_id}: {status} on {target}/{effort} (detached worker)")
+            print(f"task: {prompt}")
+            if result:
+                print(result)
+            return
+
+        self._refresh_collab_jobs_from_server()
+        agent = self._find_collab_job(job_id)
+        if agent is None:
+            raise VeyraError(f"unknown job or collaboration agent: {job_id}")
+        identity = self._collab_identity(agent)
+        route = agent.model or "unknown model"
+        if agent.effort:
+            route += f"/{agent.effort}"
+        print(f"{agent.job_id}: {agent.status} on {route} (collaboration agent)")
+        print(f"identity: {identity}")
+        print(f"thread: {agent.thread_id}")
+        if agent.parent_thread_id:
+            print(f"parent: {agent.parent_thread_id}")
+        if agent.prompt:
+            print(f"task: {agent.prompt}")
+        if agent.message:
+            print(agent.message)
 
     def _cancel_worker_job(self, job_id: str) -> None:
         with self._worker_jobs_lock:
             job = self.worker_jobs.get(job_id)
-            if job is None:
-                raise VeyraError(f"unknown background worker job: {job_id}")
+        if job is None:
+            self._refresh_collab_jobs_from_server()
+            if self._find_collab_job(job_id) is not None:
+                raise VeyraError(
+                    "native collaboration agents cannot be cancelled by /cancel-job; "
+                    "ask Veyra to interrupt that agent"
+                )
+            raise VeyraError(f"unknown job or collaboration agent: {job_id}")
+        with self._worker_jobs_lock:
             if job.status not in {"queued", "running"}:
                 raise VeyraError(f"{job_id} is already {job.status}")
             thread_id = job.worker_thread_id
@@ -3075,9 +3413,9 @@ class VeyraClient:
                 "/local MODEL PROMPT    run a bounded local worker\n"
                 "/worker MODEL PROMPT   run a bounded worker-only model\n"
                 "/bgworker MODEL PROMPT start a read-only background worker\n"
-                "/jobs                  show background worker jobs\n"
-                "/job ID                show one background worker report\n"
-                "/cancel-job ID         interrupt a background worker\n"
+                "/jobs                  show workers and collaboration agents\n"
+                "/job ID                inspect one worker or agent\n"
+                "/cancel-job ID         interrupt a detached worker\n"
                 "/branch [MODEL] [EFFORT] enter an explicit history branch\n"
                 "/new                   start an empty thread\n"
                 "/threads               list recent threads\n"
@@ -3357,7 +3695,15 @@ class VeyraClient:
                 and job.parent_thread_id in {None, self.thread_id}
                 for job in self.worker_jobs.values()
             )
+        with self._collab_jobs_lock:
+            agents_running = sum(
+                job.root_thread_id == self.thread_id
+                and job.status in COLLAB_ACTIVE_STATUSES
+                for job in self.collab_jobs.values()
+            )
         suffix = f" | workers {running}" if running else ""
+        if agents_running:
+            suffix += f" | agents {agents_running}"
         if ready:
             suffix += f" | ready {ready}"
         return suffix
